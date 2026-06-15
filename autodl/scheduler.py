@@ -58,6 +58,8 @@ def _finish_instance(ctx, uuid, on_finish, log, widx):
 
 def _run_job(ctx, snap, uuid, job, batch_id, retries, log, widx):
     rid = f"{batch_id}:{job['id']}"
+    # 开始时记一次（正确的 started_at，重试不重置）；结束时 finish_run 一次
+    ctx.reg.record_run(rid, uuid, {k: job.get(k) for k in ("command", "id")}, "(sync)", "", "")
     attempts = retries + 1
     code, err = None, ""
     for a in range(attempts):
@@ -68,13 +70,11 @@ def _run_job(ctx, snap, uuid, job, batch_id, retries, log, widx):
                 _out, err, code = ctx.ssh.run(snap, job["command"], uuid)
         except SSHUnavailable as e:
             code, err = -1, str(e)
-        ctx.reg.record_run(rid, uuid, {k: job.get(k) for k in ("command", "id")},
-                           "(sync)", "", "")
-        ctx.reg.finish_run(rid, code if code is not None else -1)
         if code == 0:
             break
         if log and a + 1 < attempts:
             log(f"[w{widx}] job {job['id']} 第{a+1}次失败(code={code})，重试")
+    ctx.reg.finish_run(rid, code if code is not None else -1)
     if log:
         log(f"[w{widx}] job {job['id']} -> exit {code}")
     return code
@@ -99,6 +99,7 @@ def run_batch(ctx, jobs, max_parallel=2, on_finish="release", select_region=True
         q.put(j)
     results, rlock = [], threading.Lock()
     created, clock = [], threading.Lock()  # 已创建实例，供中断时兜底释放
+    create_lock = threading.Lock()         # 串行化"选区+创建"，避免多 worker 抢同一稀缺区(TOCTOU)
 
     def add(d):
         with rlock:
@@ -109,8 +110,9 @@ def run_batch(ctx, jobs, max_parallel=2, on_finish="release", select_region=True
         try:
             try:
                 if select_region:
-                    region = ctx.select_region(log=None)
-                    uuid = ctx.api.create_in_region([region]) if region else ctx.api.create()
+                    with create_lock:  # 选区与创建之间不被其它 worker 插入
+                        region = ctx.select_region(log=None)
+                        uuid = ctx.api.create_in_region([region]) if region else ctx.api.create()
                 else:
                     uuid = ctx.api.create()
                 with clock:

@@ -57,7 +57,7 @@ def idle_guard(ctx, instance_uuid=None, idle_minutes=15, interval=60,
     uuid = instance_uuid or ctx.reg.get_active()
     if not uuid:
         raise APIError("没有指定实例，也没有活动实例")
-    idle_seconds = 0
+    idle_start = None  # 连续空闲的起始时刻（按真实经过时间计，避免 off-by-one）
     need = idle_minutes * 60
     while True:
         st = ctx.api.status_or_none(uuid)
@@ -93,21 +93,25 @@ def idle_guard(ctx, instance_uuid=None, idle_minutes=15, interval=60,
             time.sleep(interval)
             continue
 
+        # once 模式只做一次判定、绝不关机（避免单次探测就触发 power_off）
+        if once:
+            return "idle" if idle else "active"
+        now = time.time()
         if idle:
-            idle_seconds += interval
+            if idle_start is None:
+                idle_start = now
+            elapsed = now - idle_start
             if log:
-                log(f"  空闲 {idle_seconds}/{need}s（{detail}）")
-            if idle_seconds >= need:
+                log(f"  空闲 {int(elapsed)}/{need}s（{detail}）")
+            if elapsed >= need:
                 ctx.power_off_with_cost(uuid, log=log)
                 if log:
                     log(f"实例 {uuid} 连续空闲，已自动关机。")
                 return "powered_off"
         else:
-            if idle_seconds and log:
+            if idle_start is not None and log:
                 log(f"  恢复活跃（{detail}），空闲计时清零")
-            idle_seconds = 0
-        if once:
-            return "idle" if idle else "active"
+            idle_start = None
         time.sleep(interval)
 
 

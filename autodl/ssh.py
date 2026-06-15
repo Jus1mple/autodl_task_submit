@@ -134,6 +134,7 @@ class SSHManager:
             return ""
         pubkey = pub.read_text().strip()
         client = self.connect(snapshot, instance_uuid)
+        sftp = None
         try:
             sftp = client.open_sftp()
             try:
@@ -148,8 +149,9 @@ class SSHManager:
             )
             _in, out, err = client.exec_command(cmd)
             out.channel.recv_exit_status()
-            sftp.close()
         finally:
+            if sftp:
+                sftp.close()
             client.close()
         return key_path
 
@@ -190,18 +192,21 @@ class SSHManager:
         wd = self.cfg.remote_workdir
         task = f"{wd}/task_{run_id}.sh"
         client = self.connect(snapshot, instance_uuid)
+        sftp = None
         try:
             sftp = client.open_sftp()
             _mkdirs(sftp, wd)
             with sftp.open(task, "w") as f:
                 f.write(script_text)
-            sftp.close()
+            sftp.close(); sftp = None
             _in, out, err = client.exec_command(f"bash {task}")
             so = out.read().decode("utf-8", "replace")
             se = err.read().decode("utf-8", "replace")
             code = out.channel.recv_exit_status()
             return so, se, code
         finally:
+            if sftp:
+                sftp.close()
             client.close()
 
     def run_background_command(self, snapshot, command, run_id, instance_uuid=None):
@@ -214,10 +219,11 @@ class SSHManager:
         pid_file = f"{logs}/{run_id}.pid"
 
         client = self.connect(snapshot, instance_uuid)
+        sftp = None
         try:
             sftp = client.open_sftp()
             _mkdirs(sftp, logs)
-            sftp.close()
+            sftp.close(); sftp = None
             # setsid 完全脱离会话；exit code 落 exit_file；pid 落 pid_file。路径一律转义。
             inner = f"{command} > {_shq(log_file)} 2>&1; echo $? > {_shq(exit_file)}"
             launch = (
@@ -227,41 +233,56 @@ class SSHManager:
             _in, out, err = client.exec_command(launch)
             pid = out.read().decode().strip()
             out.channel.recv_exit_status()
+            if not pid.isdigit():
+                pid = ""  # 捕获失败则置空，poll 仅凭 exit_file 判定，避免把运行中误报为完成
         finally:
+            if sftp:
+                sftp.close()
             client.close()
         return {"pid": pid, "log": log_file, "exit_file": exit_file, "workdir": wd}
 
     def run_background(self, snapshot, script_text, run_id, instance_uuid=None):
         """上传一段脚本到数据盘并后台执行。返回 {pid, log, exit_file, workdir}。"""
+        run_id = _safe_run_id(run_id)
         wd = self.cfg.remote_workdir
         task_file = f"{wd}/task_{run_id}.sh"
         client = self.connect(snapshot, instance_uuid)
+        sftp = None
         try:
             sftp = client.open_sftp()
             _mkdirs(sftp, wd)
             with sftp.open(task_file, "w") as f:
                 f.write(script_text)
-            sftp.close()
+            sftp.close(); sftp = None
         finally:
+            if sftp:
+                sftp.close()
             client.close()
         return self.run_background_command(snapshot, f"cd {_shq(wd)} && bash {_shq(task_file)}",
                                            run_id, instance_uuid)
 
     def poll(self, snapshot, run_meta, instance_uuid=None):
         """返回 ('running'|'done', exit_code|None)。"""
-        pid = run_meta.get("pid")
+        pid = (run_meta.get("pid") or "").strip()
         exit_file = run_meta["exit_file"]
-        cmd = (
-            f"if [ -f {_shq(exit_file)} ]; then echo DONE $(cat {_shq(exit_file)}); "
-            f"elif kill -0 {pid} 2>/dev/null; then echo RUNNING; "
-            f"else echo DONE unknown; fi"
-        )
+        if pid.isdigit():
+            cmd = (
+                f"if [ -f {_shq(exit_file)} ]; then echo DONE $(cat {_shq(exit_file)}); "
+                f"elif kill -0 {pid} 2>/dev/null; then echo RUNNING; "
+                f"else echo DONE unknown; fi"
+            )
+        else:
+            # 没有可靠 pid：只凭 exit_file 判定，没有就当仍在运行（不误报完成）
+            cmd = (
+                f"if [ -f {_shq(exit_file)} ]; then echo DONE $(cat {_shq(exit_file)}); "
+                f"else echo RUNNING; fi"
+            )
         so, _se, _c = self.run(snapshot, cmd, instance_uuid)
         parts = so.split()
         if parts and parts[0] == "RUNNING":
             return "running", None
         code = None
-        if len(parts) >= 2 and parts[1].isdigit():
+        if len(parts) >= 2 and parts[1].lstrip("-").isdigit():
             code = int(parts[1])
         return "done", code
 
