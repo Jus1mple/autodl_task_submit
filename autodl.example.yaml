@@ -1,0 +1,38 @@
+# autodl 配置示例：复制为 autodl.yaml 后按需修改。
+# 注意：Token 不放这里，放 .env 的 AUTODL_TOKEN=...（避免误提交泄漏）。
+
+base_url: https://api.autodl.com
+
+# 实例规格
+image_uuid: base-image-12be412037   # 也可填你的私有镜像，如 image-67b066536a
+gpu_spec_uuid: v-48g                 # RTX4090-48G
+cuda_v_from: 111                     # 最低 CUDA 11.1
+instance_name: task-runner
+expand_disk_gb: 10
+data_center_list: []                 # 留空=自动调度；填 ["westDC2"] 则锁定区域
+
+# 选区 / 库存
+regions: [westDC2, westDC3, beijingDC1]   # --select-region 时按此顺序找有空闲卡的区
+stock_region: westDC2
+gpu_stock_name: vGPU-48GB                  # 库存里对应 v-48g 的型号名
+
+# 护栏
+min_balance_yuan: 10.0               # 余额低于此值则中止开机
+
+# 本地状态
+registry_path: .autodl/registry.db   # 多实例台账（替代旧的 .instance_uuid）
+
+http:
+  timeout_connect: 10.0
+  timeout_read: 30.0
+  retries: 3        # 仅幂等读接口重试；create/power_*/release 不自动重试
+  backoff: 1.5
+
+ssh:
+  user: root
+  remote_workdir: /root/autodl-tmp   # 数据盘，放代码/数据/日志
+  connect_timeout: 20.0
+  connect_retries: 5
+  retry_interval: 5.0
+  identity_file: ""                  # 留空自动探测 ~/.ssh/id_ed25519 等，没有则生成
+  config_alias: autodl               # 写入 ~/.ssh/config 的 Host 别名
