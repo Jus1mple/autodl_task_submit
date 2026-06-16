@@ -97,6 +97,21 @@ uv run python -m autodl snapshot-env --name myenv-v1 --instance pro-xxxx
 ```
 把配好的实例存成私有镜像并轮询到 `finished`，之后在 `autodl.yaml` 设 `image_uuid` 即可秒级复现环境。⚠️ AutoDL **没有删除镜像的 API**，镜像会持续占存储费，只能去控制台删——确认需要再存。
 
+## 可视化实验大盘（Web）
+
+```bash
+pip install 'autodl-task-submit[web]'    # 或本地开发：uv sync --extra web
+uv run autodl web                         # 默认 http://127.0.0.1:8848
+```
+
+四个页面:
+- **概览**:余额、实例/实验数量、任务与实例的状态分布图。
+- **实例**:列表 + 开机/关机/释放;「新建/开机实例」后台进行、前端轮询(浏览器不卡)。
+- **提交 & 实验**:选实例 → 跑实例上已有脚本(`remote_script`)/任意命令/上传脚本,**后台运行**;每个实验记录状态、退出码、用时、配置与指标,点开看实时日志。
+- **大盘**:跨实验的「指标 × 实验」对比表 + 按某指标排序的柱状图。
+
+**指标怎么记**:实验在数据盘写一个 `metrics.json`(如 `{"acc":0.97,"loss":0.12}`),任务完成时大盘**自动抓取入库**;也可在实验详情里手动填 JSON,或直接 `POST /api/runs/<run_id>/metrics`。后端是 FastAPI,所有能力都复用 CLI 那套实例/SSH/台账逻辑;前端是零构建的单页(原生 JS + Chart.js)。
+
 ## 设计要点
 
 - **HTTP 稳健层**：超时 + 对只读接口指数退避重试；`create`/`power_*`/`release` 等写接口**绝不自动重试**，避免重复开机/重复扣费。

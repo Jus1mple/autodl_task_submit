@@ -388,6 +388,19 @@ def cmd_batch(ctx, args):
     return EXIT_TASK if bad else EXIT_OK
 
 
+def cmd_web(ctx, args):
+    try:
+        from .web.server import serve
+    except ImportError as e:
+        print("缺少 web 依赖。安装：pip install 'autodl-task-submit[web]'  或  uv add fastapi uvicorn",
+              file=sys.stderr)
+        print(f"（{e}）", file=sys.stderr)
+        return EXIT_USAGE
+    print(f"启动实验大盘: http://{args.host}:{args.port}  （Ctrl-C 退出）")
+    serve(host=args.host, port=args.port, cfg=ctx.cfg)
+    return EXIT_OK
+
+
 def _balance_guard(ctx):
     bal = ctx.api.balance_yuan()
     if bal < ctx.cfg.min_balance_yuan:
@@ -459,6 +472,9 @@ def build_parser():
     sp.add_argument("--interval", type=int, default=300, help="轮询间隔(秒)")
     sp.add_argument("--stop-mode", choices=["stop_all", "active"], default="stop_all", help="急停范围")
     sp.add_argument("--once", action="store_true", help="只查一次")
+    sp = add("web", help="启动可视化实验大盘（需 [web] 依赖）")
+    sp.add_argument("--host", default="127.0.0.1", help="监听地址")
+    sp.add_argument("--port", type=int, default=8848, help="端口")
     sp = add("batch", help="批量并行调度（多实例跑多任务）")
     sp.add_argument("--file", required=True, help="任务清单 YAML（list of {id, remote_script|remote|script}）")
     sp.add_argument("--max-parallel", type=int, default=2, help="并发实例数上限")
@@ -481,7 +497,7 @@ _DISPATCH = {
     "stop-all": cmd_stop_all, "up": cmd_up, "down": cmd_down, "use": cmd_use, "run": cmd_run,
     "logs": cmd_logs, "push": cmd_push, "pull": cmd_pull,
     "snapshot-env": cmd_snapshot_env, "idle-guard": cmd_idle_guard,
-    "balance-watch": cmd_balance_watch, "batch": cmd_batch,
+    "balance-watch": cmd_balance_watch, "batch": cmd_batch, "web": cmd_web,
 }
 
 

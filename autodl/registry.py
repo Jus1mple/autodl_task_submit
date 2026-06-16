@@ -45,6 +45,15 @@ CREATE TABLE IF NOT EXISTS runs (
     ended_at      REAL
 );
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
+CREATE TABLE IF NOT EXISTS metrics (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id      TEXT,
+    key         TEXT,
+    value       REAL,      -- 数值（可比较/画图）；非数值则为 NULL
+    value_text  TEXT,      -- 原始文本
+    recorded_at REAL
+);
+CREATE INDEX IF NOT EXISTS idx_metrics_run ON metrics(run_id);
 """
 
 
@@ -158,3 +167,33 @@ class Registry:
         with self._conn() as c:
             r = c.execute("SELECT * FROM runs WHERE run_id=?", (run_id,)).fetchone()
             return dict(r) if r else None
+
+    # ---------------- metrics ----------------
+    def record_metrics(self, run_id, mapping):
+        """记录一组指标（同 run_id 同 key 覆盖旧值）。值能转 float 则存 value，否则只存 value_text。"""
+        now = time.time()
+        with self._conn() as c:
+            for key, raw in (mapping or {}).items():
+                try:
+                    val = float(raw)
+                except (TypeError, ValueError):
+                    val = None
+                c.execute("DELETE FROM metrics WHERE run_id=? AND key=?", (run_id, str(key)))
+                c.execute(
+                    "INSERT INTO metrics(run_id, key, value, value_text, recorded_at) VALUES(?,?,?,?,?)",
+                    (run_id, str(key), val, str(raw), now),
+                )
+
+    def get_metrics(self, run_id):
+        with self._conn() as c:
+            rows = c.execute("SELECT key, value, value_text FROM metrics WHERE run_id=?", (run_id,))
+            return {r["key"]: (r["value"] if r["value"] is not None else r["value_text"]) for r in rows}
+
+    def all_metrics(self):
+        """返回 {run_id: {key: value}}，用于大盘对比。"""
+        out = {}
+        with self._conn() as c:
+            for r in c.execute("SELECT run_id, key, value, value_text FROM metrics"):
+                out.setdefault(r["run_id"], {})[r["key"]] = (
+                    r["value"] if r["value"] is not None else r["value_text"])
+        return out
