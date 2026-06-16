@@ -19,6 +19,33 @@ from .errors import APIError, RateLimited
 # 这些 AutoDL 业务码代表"操作已是目标态"，调用方通常可容忍（如重复关机/已释放）
 TOLERABLE_CODES = {"BadRequest"}
 
+# gpu_spec_uuid 固定表（来自官方文档附录，无枚举接口）：uuid -> 人类可读型号
+GPU_SPECS = [
+    {"uuid": "v-48g", "label": "RTX 4090-48G", "category": "通用型"},
+    {"uuid": "4090D", "label": "RTX 4090D", "category": "通用型"},
+    {"uuid": "v-48g-350w", "label": "RTX 3090-48G", "category": "通用型"},
+    {"uuid": "h800", "label": "H800-80G", "category": "通用型"},
+    {"uuid": "pro6000-p", "label": "RTX PRO6000-96G", "category": "性能型"},
+    {"uuid": "v-32g-p", "label": "RTX 4080(S)-32G", "category": "性能型"},
+    {"uuid": "5090-p", "label": "RTX 5090-32G", "category": "性能型"},
+]
+GPU_SPEC_LABELS = {s["uuid"]: s["label"] for s in GPU_SPECS}
+
+# region_sign 固定表（官方文档）
+REGIONS = [
+    {"sign": "westDC2", "name": "西北企业区"},
+    {"sign": "westDC3", "name": "西北B区"},
+    {"sign": "beijingDC1", "name": "北京A区"},
+    {"sign": "beijingDC2", "name": "北京B区"},
+    {"sign": "beijingDC3", "name": "北京C区"},
+    {"sign": "beijingDC4", "name": "北京D区"},
+    {"sign": "neimengDC1", "name": "内蒙A区"},
+    {"sign": "neimengDC3", "name": "内蒙C区"},
+    {"sign": "foshanDC1", "name": "佛山区"},
+    {"sign": "chongqingDC1", "name": "重庆A区"},
+    {"sign": "yangzhouDC1", "name": "扬州区"},
+]
+
 
 class AutoDLClient:
     def __init__(self, cfg: Config):
@@ -133,7 +160,7 @@ class AutoDLClient:
     def create(self):
         c = self.cfg
         body = {
-            "req_gpu_amount": 1,
+            "req_gpu_amount": c.req_gpu_amount,
             "expand_system_disk_by_gb": c.expand_disk_gb,
             "gpu_spec_uuid": c.gpu_spec_uuid,
             "image_uuid": c.image_uuid,
@@ -149,7 +176,7 @@ class AutoDLClient:
         """临时指定区域创建（用于库存驱动选区，不改全局配置）。"""
         c = self.cfg
         body = {
-            "req_gpu_amount": 1,
+            "req_gpu_amount": c.req_gpu_amount,
             "expand_system_disk_by_gb": c.expand_disk_gb,
             "gpu_spec_uuid": c.gpu_spec_uuid,
             "image_uuid": c.image_uuid,
@@ -165,6 +192,23 @@ class AutoDLClient:
         data = self._post("/api/v1/dev/instance/pro/image/save",
                           {"instance_uuid": instance_uuid, "image_name": image_name})
         return data.get("image_uuid") if isinstance(data, dict) else data
+
+    def create_custom(self, *, gpu_spec_uuid=None, req_gpu_amount=1, expand_disk_gb=None,
+                      data_center_list=None, image_uuid=None, cuda_v_from=None, instance_name=None):
+        """按显式参数创建实例（前端创建表单用）。未给的字段回退到配置默认。"""
+        c = self.cfg
+        body = {
+            "req_gpu_amount": int(req_gpu_amount),
+            "expand_system_disk_by_gb": int(expand_disk_gb if expand_disk_gb is not None else c.expand_disk_gb),
+            "gpu_spec_uuid": gpu_spec_uuid or c.gpu_spec_uuid,
+            "image_uuid": image_uuid or c.image_uuid,
+            "cuda_v_from": int(cuda_v_from if cuda_v_from is not None else c.cuda_v_from),
+            "instance_name": instance_name or c.instance_name,
+            "start_command": "sleep infinity",
+        }
+        if data_center_list:
+            body["data_center_list"] = list(data_center_list)
+        return self._post("/api/v1/dev/instance/pro/create", body)
 
     def power_on(self, instance_uuid, with_gpu=True):
         # 注意：无卡(CPU)模式的 payload 取值未在文档确证，默认带卡。

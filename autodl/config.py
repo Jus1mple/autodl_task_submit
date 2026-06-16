@@ -44,6 +44,7 @@ class Config:
     cuda_v_from: int = 111
     instance_name: str = "task-runner"
     expand_disk_gb: int = 10
+    req_gpu_amount: int = 1
     data_center_list: list = field(default_factory=list)  # 空=让 AutoDL 自动调度
     regions: list = field(default_factory=lambda: ["westDC2", "westDC3", "beijingDC1"])
     stock_region: str = "westDC2"
