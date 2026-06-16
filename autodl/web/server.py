@@ -123,7 +123,7 @@ def create_app(cfg=None):
             spec = it.get("gpu_spec_uuid")
             out.append({"instance_uuid": uid, "status": it.get("status"),
                         "billing": _billing(it.get("status")),
-                        "gpu": GPU_SPEC_LABELS.get(spec, spec or "?"),
+                        "gpu": GPU_SPEC_LABELS.get(spec, spec or "?"), "gpu_spec": spec,
                         "gpu_amount": it.get("req_gpu_amount"),
                         "region": it.get("region_name") or it.get("region_sign"),
                         "name": it.get("name"), "active": uid == active})

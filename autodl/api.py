@@ -19,14 +19,16 @@ from .errors import APIError, RateLimited
 # 这些 AutoDL 业务码代表"操作已是目标态"，调用方通常可容忍（如重复关机/已释放）
 TOLERABLE_CODES = {"BadRequest"}
 
-# gpu_spec_uuid 固定表（来自官方文档附录，无枚举接口）：uuid -> 人类可读型号
+# gpu_spec_uuid 固定表（来自官方文档附录，无枚举接口）。
+# label 用 AutoDL 控制台/库存的实际名称（括号里标芯片），避免与控制台叫法不一致引起误解：
+# 例如 v-48g 在控制台叫「vGPU-48GB」，物理是 48G 显存的 4090（nvidia-smi 显示 RTX 4090）。
 GPU_SPECS = [
-    {"uuid": "v-48g", "label": "RTX 4090-48G", "category": "通用型"},
+    {"uuid": "v-48g", "label": "vGPU-48GB（4090·48G）", "category": "通用型"},
+    {"uuid": "v-32g-p", "label": "vGPU-32GB（4080S·32G）", "category": "性能型"},
     {"uuid": "4090D", "label": "RTX 4090D", "category": "通用型"},
     {"uuid": "v-48g-350w", "label": "RTX 3090-48G", "category": "通用型"},
     {"uuid": "h800", "label": "H800-80G", "category": "通用型"},
     {"uuid": "pro6000-p", "label": "RTX PRO6000-96G", "category": "性能型"},
-    {"uuid": "v-32g-p", "label": "RTX 4080(S)-32G", "category": "性能型"},
     {"uuid": "5090-p", "label": "RTX 5090-32G", "category": "性能型"},
 ]
 GPU_SPEC_LABELS = {s["uuid"]: s["label"] for s in GPU_SPECS}

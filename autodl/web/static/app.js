@@ -33,7 +33,7 @@ const SC = { running: "#37c871", succeeded: "#37c871", failed: "#ff5d5d", shutdo
 async function loadMeta() {
   META = await api("/api/meta");
   const regOpts = META.regions.map((r) => `<option value="${r.sign}">${r.name} (${r.sign})</option>`).join("");
-  const gpuOpts = META.gpu_specs.map((g) => `<option value="${g.uuid}">${g.label} · ${g.category}</option>`).join("");
+  const gpuOpts = META.gpu_specs.map((g) => `<option value="${g.uuid}">${g.label} · ${g.uuid} · ${g.category}</option>`).join("");
   $("#e-region").innerHTML = `<option value="">（默认/自动）</option>` + regOpts;
   $("#e-gpu").innerHTML = gpuOpts;
   if (META.default.gpu_spec_uuid) $("#e-gpu").value = META.default.gpu_spec_uuid;
@@ -52,15 +52,24 @@ async function loadOverview() {
     ["实例", s.instances_total], ["实验", s.experiments_total], ["运行", s.runs_total], ["平均用时", fmtDur(s.avg_duration_sec)]];
   $("#summary-cards").innerHTML = cards.map((c) => `<div class="card"><div class="k">${c[0]}</div><div class="v">${c[1]}</div></div>`).join("");
   const rb = s.runs_by_status || {}, ib = s.instances_by_status || {};
+  // 文字徽章：始终可见，不依赖 Chart.js（CDN 失败也能看状态）
+  $("#inst-status-text").innerHTML = statusChips(ib, "暂无实例");
+  $("#run-status-text").innerHTML = statusChips(rb, "暂无任务");
   drawChart("chart-runs", "doughnut", Object.keys(rb), Object.values(rb), { colors: Object.keys(rb).map((k) => SC[k] || "#4f8cff") });
   drawChart("chart-inst", "doughnut", Object.keys(ib), Object.values(ib), { colors: Object.keys(ib).map((k) => SC[k] || "#4f8cff") });
+  if (!window.Chart) { $("#run-status-text").innerHTML += ` <span class="muted">(图表库未加载)</span>`; }
+}
+function statusChips(obj, emptyText) {
+  const ks = Object.keys(obj);
+  if (!ks.length) return `<span class="muted">${esc(emptyText || "暂无")}</span>`;
+  return ks.map((k) => `<span class="chip">${tag(k)} × <b>${obj[k]}</b></span>`).join("");
 }
 
 // ---------- 实例 ----------
 async function loadInstances() {
   const { instances } = await api("/api/instances");
   $("#inst-rows").innerHTML = instances.length ? instances.map((it) => `
-    <tr><td>${esc(it.instance_uuid)}${it.active ? " ⭐" : ""}</td><td>${esc(it.gpu)}</td><td>${it.gpu_amount ?? "—"}</td>
+    <tr><td>${esc(it.instance_uuid)}${it.active ? " ⭐" : ""}</td><td>${esc(it.gpu)}${it.gpu_spec ? ` <span class="muted">(${esc(it.gpu_spec)})</span>` : ""}</td><td>${it.gpu_amount ?? "—"}</td>
     <td>${esc(it.region || "")}</td><td>${tag(it.status)}</td><td>${esc(it.billing)}</td>
     <td><button class="sm" onclick="instAction('${esc(it.instance_uuid)}','power_on')" ${it.status === "running" ? "disabled" : ""}>开机</button>
     <button class="sm" onclick="instAction('${esc(it.instance_uuid)}','power_off')" ${it.status !== "running" ? "disabled" : ""}>关机</button>
@@ -78,7 +87,7 @@ function openCreate() {
   openModal(`<h2>创建实例</h2>
     <div class="row"><div><label>区域</label><select id="c-region"><option value="">（自动调度）</option>
       ${META.regions.map((r) => `<option value="${r.sign}">${r.name} (${r.sign})</option>`).join("")}</select></div>
-      <div><label>GPU 类型</label><select id="c-gpu">${META.gpu_specs.map((g) => `<option value="${g.uuid}" ${g.uuid === d.gpu_spec_uuid ? "selected" : ""}>${g.label} · ${g.category}</option>`).join("")}</select></div></div>
+      <div><label>GPU 类型</label><select id="c-gpu">${META.gpu_specs.map((g) => `<option value="${g.uuid}" ${g.uuid === d.gpu_spec_uuid ? "selected" : ""}>${g.label} · ${g.uuid} · ${g.category}</option>`).join("")}</select></div></div>
     <div class="row"><div><label>GPU 数量 (1–4)</label><select id="c-num"><option>1</option><option>2</option><option>3</option><option>4</option></select></div>
       <div><label>系统盘扩容 GB (0–500)</label><input id="c-disk" type="number" value="${d.expand_disk_gb ?? 10}" min="0" max="500"></div></div>
     <div class="row"><div><label>镜像 image_uuid</label><input id="c-image" value="${esc(d.image_uuid || "")}"></div>
@@ -259,5 +268,10 @@ async function refreshAll() {
   try { await Promise.all([loadOverview(), loadInstances(), loadStock()]); if ($("#experiments").classList.contains("active")) { loadExperiments(); loadRuns(); } }
   catch (e) { toast("刷新失败: " + e.message, true); }
 }
-(async () => { await loadMeta(); onModeChange(); addMetricRow("Accuracy", "auto"); await refreshAll(); await loadTags(); })();
+(async () => {
+  try { await loadMeta(); } catch (e) { toast("加载元信息失败: " + e.message, true); }  // 不阻塞概览
+  onModeChange(); addMetricRow("Accuracy", "auto");
+  await refreshAll();
+  try { await loadTags(); } catch (e) { /* 忽略 */ }
+})();
 setInterval(() => { if ($("#overview").classList.contains("active")) loadOverview(); }, 15000);

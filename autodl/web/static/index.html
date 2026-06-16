@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>autodl 实验大盘</title>
-<script src="https://cdn.bootcdn.net/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<script src="/static/chart.umd.min.js"></script>
 <style>
   :root { --bg:#0f1115; --panel:#181b22; --panel2:#1f232c; --line:#2a2f3a; --fg:#e6e8ec;
           --muted:#9aa3b2; --accent:#4f8cff; --green:#37c871; --red:#ff5d5d; --yellow:#f5b942; }
@@ -74,8 +74,8 @@
   <section id="overview" class="active">
     <div class="cards" id="summary-cards"></div>
     <div class="row">
-      <div class="panel" style="flex:1"><h2>任务状态</h2><canvas id="chart-runs"></canvas></div>
-      <div class="panel" style="flex:1"><h2>实例状态</h2><canvas id="chart-inst"></canvas></div>
+      <div class="panel" style="flex:1"><h2>实例状态</h2><div class="chips" id="inst-status-text" style="margin-bottom:10px"></div><canvas id="chart-inst"></canvas></div>
+      <div class="panel" style="flex:1"><h2>任务状态</h2><div class="chips" id="run-status-text" style="margin-bottom:10px"></div><canvas id="chart-runs"></canvas></div>
     </div>
   </section>
 
