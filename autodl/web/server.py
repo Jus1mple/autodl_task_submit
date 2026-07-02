@@ -8,23 +8,19 @@
 """
 from __future__ import annotations
 
-import base64
 import json
-import posixpath
-import re
-import shlex
 import threading
 import time
-import uuid as uuidlib
 
 from fastapi import Body, FastAPI, HTTPException
 from fastapi.responses import FileResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from pathlib import Path
 
+from .. import tasks
 from ..api import GPU_SPECS, GPU_SPEC_LABELS, REGIONS
 from ..config import load_config, require_token
-from ..core import Context
+from ..core import Context, billing_class
 from ..errors import APIError, SSHUnavailable
 
 _STATIC = Path(__file__).parent / "static"
@@ -37,40 +33,9 @@ def _int(v, default):
         return default
 
 
-def _billing(status):
-    if status == "running":
-        return "带卡计费"
-    if status in ("shutdown", "power_off", "shutting_down"):
-        return "仅磁盘计费"
-    return status or "?"
-
-
-def _build_command(mode, value):
-    """remote_script/remote → 远端命令字符串；script_text → None（走上传）。"""
-    if mode == "remote_script":
-        p = value.strip()
-        # 用双引号让远端 shell 展开 ~ / $HOME（单引号会导致 ~ 不展开、cd 失败）
-        if p.startswith("~/"):
-            p = "$HOME/" + p[2:]
-        elif p == "~":
-            p = "$HOME"
-        d = posixpath.dirname(p) or "."
-        n = posixpath.basename(p)
-        return f'cd "{d}" && bash "{n}"'
-    if mode == "remote":
-        return value
-    return None
-
-
 def _slug(s):
     """实验 id：保留 unicode 字母数字（中文可读），仅替换空格/符号。"""
     return "".join(ch if (ch.isalnum() or ch in "_.-") else "_" for ch in str(s))[:60] or "exp"
-
-
-def _ascii_id(s):
-    """远端 run_id：必须 ASCII（ssh._safe_run_id 只允许 [A-Za-z0-9_.-]）。中文等会被剥成可读前缀。"""
-    out = "".join(ch if ((ch.isascii() and ch.isalnum()) or ch in "_.-") else "_" for ch in str(s))[:50]
-    return out.strip("_") or "exp"
 
 
 def create_app(cfg=None):
@@ -80,7 +45,7 @@ def create_app(cfg=None):
     from .jobs import JobStore
     jobs = JobStore()
 
-    app = FastAPI(title="autodl dashboard", version="1.2.0")
+    app = FastAPI(title="autodl dashboard", version="1.3.0")
 
     # ---------- 元信息：GPU 规格 / 区域（给创建表单用）----------
     @app.get("/api/meta")
@@ -122,7 +87,7 @@ def create_app(cfg=None):
             uid = it.get("instance_uuid") or it.get("uuid")
             spec = it.get("gpu_spec_uuid")
             out.append({"instance_uuid": uid, "status": it.get("status"),
-                        "billing": _billing(it.get("status")),
+                        "billing": billing_class(it.get("status")),
                         "gpu": GPU_SPEC_LABELS.get(spec, spec or "?"), "gpu_spec": spec,
                         "gpu_amount": it.get("req_gpu_amount"),
                         "region": it.get("region_name") or it.get("region_sign"),
@@ -154,18 +119,9 @@ def create_app(cfg=None):
                 ctx.power_off_with_cost(uuid, log=None)
             elif action == "release":
                 with ctx.reg.lock():
-                    try:
-                        ctx.api.power_off(uuid)
-                    except APIError:
-                        pass
-                    for _ in range(8):  # 等实例真正关机再释放（release 前需 shutdown）
-                        time.sleep(2)
-                        if ctx.api.status_or_none(uuid) in ("shutdown", "power_off", None, "removed"):
-                            break
-                    ctx.api.release(uuid)  # raw 容错：已释放/进行中也不抛
-                    ctx.reg.remove_instance(uuid)
-                    if ctx.reg.get_active() == uuid:
-                        ctx.reg.set_active(None)
+                    if not ctx.finish_instance(uuid, "release", log=None):
+                        raise HTTPException(502, f"释放 {uuid} 失败，实例可能仍在计费，"
+                                                 "请稍后重试或去控制台处理")
             else:
                 raise HTTPException(400, f"未知动作 {action}")
         except APIError as e:
@@ -192,7 +148,7 @@ def create_app(cfg=None):
         def task(log):
             log(f"创建实例：{opts.get('gpu_spec_uuid')} x{opts['req_gpu_amount']} @ {opts.get('data_center_list')}")
             with ctx.reg.lock():
-                uuid = ctx.api.create_custom(**opts)
+                uuid = ctx.api.create(**opts)
                 ctx.reg.upsert_instance(uuid, name=opts.get("instance_name") or cfg.instance_name,
                                         gpu_spec=opts.get("gpu_spec_uuid"), status_cached="creating")
                 ctx.reg.set_active(uuid)
@@ -319,36 +275,26 @@ def create_app(cfg=None):
             raise HTTPException(400, "未指定实例，且无活动实例（请先创建/开机）")
         if ctx.api.status_or_none(uuid) != "running":
             raise HTTPException(409, "实例非 running，请先开机")
-        # 高熵后缀：避免不同(中文)实验或同秒重复运行产生相同 run_id 而覆盖/串台
-        run_id = _ascii_id(eid) + f"-{int(time.time())}-{uuidlib.uuid4().hex[:6]}"
-        wd = cfg.ssh.remote_workdir
-        metrics_file = f"{wd}/metrics.json"
-        mode, val = e["exec_mode"], e["exec_value"]
-        command = _build_command(mode, val)
+        # make_run_id 自带时间戳+高熵后缀：不同(中文)实验或同秒重复运行也不会覆盖/串台
+        run_id = tasks.make_run_id(eid)
         try:
             snap = ctx.api.snapshot(uuid)
-            # 把实验的 YAML 配置写到实例（命令里可读 config.yaml）
-            if e.get("config_yaml"):
-                _write_remote_file(ctx, snap, uuid, f"{wd}/config.yaml", e["config_yaml"])
-            if command is None:  # script_text
-                meta_run = ctx.ssh.run_background(snap, val, run_id, uuid)
-            else:
-                meta_run = ctx.ssh.run_background_command(snap, command, run_id, uuid)
+            res = tasks.run_background(
+                ctx, snap, uuid, mode=e["exec_mode"], value=e["exec_value"], run_id=run_id,
+                name=e["name"], config_yaml=e.get("config_yaml") or None,
+                metrics_spec=json.loads(e.get("metrics_spec") or "[]"),
+                experiment_id=eid, tag=e.get("tag"),
+            )
         except (SSHUnavailable, APIError, KeyError, ValueError) as ex:
             raise HTTPException(502, f"任务启动失败：{ex}")
-        cfg_d = {"name": e["name"], "command": command or "(script)", "metrics_file": metrics_file,
-                 "metrics_spec": json.loads(e.get("metrics_spec") or "[]"),
-                 "config_yaml": e.get("config_yaml", "")}
-        ctx.reg.record_run(run_id, uuid, cfg_d, meta_run["log"], meta_run["exit_file"], meta_run["pid"],
-                           experiment_id=eid, tag=e.get("tag"))
-        return {"run_id": run_id, "pid": meta_run["pid"]}
+        return {"run_id": run_id, "pid": res["pid"]}
 
     @app.get("/api/experiments/{eid}/submit_script")
     def experiment_script(eid: str):
         e = ctx.reg.get_experiment(eid)
         if not e:
             raise HTTPException(404, "experiment not found")
-        return PlainTextResponse(_generate_submit_script(e, cfg))
+        return PlainTextResponse(_generate_submit_script(e))
 
     # ---------- runs / 指标 ----------
     @app.get("/api/runs")
@@ -371,28 +317,15 @@ def create_app(cfg=None):
         r = ctx.reg.get_run(run_id)
         if not r:
             raise HTTPException(404, "run not found")
+        info = tasks.refresh_run(ctx, r, lines=lines)  # 探活/tail/完成登记/抓指标一步到位
+        if info["state"] == "done":
+            r = ctx.reg.get_run(run_id) or r
         cfg_d = json.loads(r.get("config_json") or "{}")
-        log, note = "", ""
-        uuid = r["instance_uuid"]
-        if r["status"] == "running" and r.get("exit_file"):
-            try:
-                snap = ctx.api.snapshot(uuid)
-                state, code = ctx.ssh.poll(snap, {"pid": r.get("pid"), "exit_file": r["exit_file"]}, uuid)
-                if r.get("log_path"):
-                    log = ctx.ssh.tail(snap, r["log_path"], lines=lines, instance_uuid=uuid)
-                if state == "done":
-                    ctx.reg.finish_run(run_id, code if code is not None else -1)
-                    _extract_metrics(ctx, snap, uuid, run_id, cfg_d.get("metrics_spec"),
-                                     cfg_d.get("metrics_file"), r.get("log_path"))
-                    r = ctx.reg.get_run(run_id)
-            except SSHUnavailable as e:
-                note = f"实例 SSH 不可达（{e.reason}），仅显示已存状态"
-            except APIError as e:
-                note = f"API 出错：{e}"
-        return {"run_id": run_id, "status": r["status"], "exit_code": r["exit_code"], "instance": uuid,
+        return {"run_id": run_id, "status": r["status"], "exit_code": r["exit_code"],
+                "instance": r["instance_uuid"],
                 "experiment_id": r.get("experiment_id"), "tag": r.get("tag"), "config": cfg_d,
                 "metrics": ctx.reg.get_metrics(run_id), "series": ctx.reg.get_metric_series(run_id),
-                "log": log, "note": note}
+                "log": info["log"], "note": info["note"]}
 
     @app.post("/api/runs/{run_id}/metrics")
     def record_metrics(run_id: str, payload: dict = Body(...)):
@@ -435,23 +368,13 @@ def create_app(cfg=None):
 
 
 def _reconcile_running(ctx):
-    """对所有 status==running 且有 exit_file 的 run 做一次轻量 poll；完成则 finish + 抓指标。"""
+    """对所有 status==running 且有 exit_file 的 run 做一次轻量 poll；完成则 finish + 抓指标。
+    refresh_run 自己消化 SSH/API 错误（实例关机/释放时跳过，不误判完成）。"""
     for r in ctx.reg.list_runs():
         if r.get("status") != "running" or not r.get("exit_file"):
             continue
-        uuid = r["instance_uuid"]
         try:
-            if ctx.api.status_or_none(uuid) != "running":
-                continue  # 实例已关机/释放，SSH 不可达，跳过（不误判完成）
-            snap = ctx.api.snapshot(uuid)
-            state, code = ctx.ssh.poll(snap, {"pid": r.get("pid"), "exit_file": r["exit_file"]}, uuid)
-            if state == "done":
-                ctx.reg.finish_run(r["run_id"], code if code is not None else -1)
-                cfg_d = json.loads(r.get("config_json") or "{}")
-                _extract_metrics(ctx, snap, uuid, r["run_id"], cfg_d.get("metrics_spec"),
-                                 cfg_d.get("metrics_file"), r.get("log_path"))
-        except (SSHUnavailable, APIError):
-            continue
+            tasks.refresh_run(ctx, r, lines=0)
         except Exception:  # noqa: BLE001 - 对账线程绝不能崩
             continue
 
@@ -464,132 +387,62 @@ def _safe_balance(ctx):
         return None
 
 
-def _write_remote_file(ctx, snap, uuid, path, content):
-    b64 = base64.b64encode(content.encode("utf-8")).decode("ascii")
-    ctx.ssh.run(snap, f"echo {shlex.quote(b64)} | base64 -d > {shlex.quote(path)}", uuid)
-
-
-def _extract_metrics(ctx, snap, uuid, run_id, metrics_spec, metrics_file, log_path):
-    """完成时抓指标：metrics.json 顶层标量 + series 曲线 + metrics_spec 声明的 (json/正则/auto)。
-    本函数自己吞掉所有异常——抓指标失败绝不应让 run_detail/对账线程 500 或崩溃。"""
-    try:
-        import shlex as _shlex
-        jdata = {}
-        if metrics_file:
-            try:
-                out, _e, _c = ctx.ssh.run(snap, f"cat {_shlex.quote(metrics_file)} 2>/dev/null || true", uuid)
-                if out.strip():
-                    jdata = json.loads(out)
-            except (SSHUnavailable, APIError, ValueError):
-                jdata = {}
-        # 正则抓取用独立的大窗口日志（与 UI 展示的 lines 解耦）
-        log_text = ""
-        if log_path:
-            try:
-                log_text = ctx.ssh.tail(snap, log_path, lines=2000, instance_uuid=uuid)
-            except (SSHUnavailable, APIError):
-                log_text = ""
-        scalars = {}
-        if isinstance(jdata, dict):
-            for k, v in jdata.items():
-                if k != "series" and isinstance(v, (int, float, str)):
-                    scalars[k] = v
-            series = jdata.get("series")
-            if isinstance(series, list):
-                for pt in series:
-                    if isinstance(pt, dict) and isinstance(pt.get("step"), (int, float)):
-                        stepped = {k: v for k, v in pt.items() if k != "step" and isinstance(v, (int, float))}
-                        if stepped:
-                            try:
-                                ctx.reg.record_metrics(run_id, stepped, step=pt["step"])
-                            except Exception:  # noqa: BLE001
-                                pass
-        for spec in (metrics_spec or []):
-            name = spec.get("name")
-            if not name:
-                continue
-            src, pat = spec.get("source", "auto"), spec.get("pattern")
-            if src in ("json", "auto") and isinstance(jdata, dict) and name in jdata:
-                scalars[name] = jdata[name]
-                continue
-            if src in ("regex", "auto") and log_text:
-                rx = pat or (re.escape(name) + r"\s*[:=]\s*([-+]?[0-9]*\.?[0-9]+)")
-                try:
-                    ms = re.findall(rx, log_text)
-                except re.error:
-                    ms = []
-                if ms:
-                    last = ms[-1]
-                    if isinstance(last, tuple):  # 多分组：取最后一个非空组
-                        last = next((g for g in reversed(last) if g), "")
-                    if last != "":
-                        scalars[name] = last
-        if scalars:
-            ctx.reg.record_metrics(run_id, scalars)
-    except Exception:  # noqa: BLE001 - 抓指标永不致命
-        pass
-
-
-def _generate_submit_script(e, cfg):
+def _generate_submit_script(e):
+    """生成独立可运行的提交脚本：只是 tasks.submit() 的一层参数壳，逻辑不再复制。"""
     pref = json.loads(e.get("instance_pref") or "{}")
-    mode, val = e["exec_mode"], e["exec_value"]
-    command = _build_command(mode, val) or "bash task.sh"
     name, tag = e["name"], e.get("tag") or ""
-    slug = _ascii_id(name)
-    wd = cfg.ssh.remote_workdir
+    slug = tasks.ascii_id(name)
+    spec = json.loads(e.get("metrics_spec") or "[]")
+    overrides = []
+    if pref.get("gpu_spec_uuid"):
+        overrides.append(f"cfg.gpu_spec_uuid = {json.dumps(pref['gpu_spec_uuid'])}")
+    if pref.get("req_gpu_amount") is not None:
+        overrides.append(f"cfg.req_gpu_amount = {_int(pref['req_gpu_amount'], 1)}")
+    if pref.get("expand_disk_gb") is not None:
+        overrides.append(f"cfg.expand_disk_gb = {_int(pref['expand_disk_gb'], 10)}")
+    if pref.get("cuda_v_from") is not None:
+        overrides.append(f"cfg.cuda_v_from = {_int(pref['cuda_v_from'], 111)}")
+    if pref.get("image_uuid"):
+        overrides.append(f"cfg.image_uuid = {json.dumps(pref['image_uuid'])}")
+    if pref.get("region"):
+        overrides.append(f"cfg.data_center_list = [{json.dumps(pref['region'])}]")
+    override_block = "\n".join(overrides) or "# （无覆盖，全部用 autodl.yaml 默认）"
     return f'''#!/usr/bin/env python3
 """自动生成 · 实验「{name}」(tag={tag}) 提交脚本。
 
 前置：pip install "autodl-task-submit"，且 .env 里有 AUTODL_TOKEN。
 运行：python {slug}_submit.py
-脚本会：创建/复用实例 -> 写 config.yaml -> 跑实验 -> 拉回 metrics.json -> 关机（保留以便复用）。
+流程：余额护栏 -> 创建/复用实例 -> 写 config.yaml -> 跑实验（实时回显、记入本地台账）
+      -> 抓取 metrics.json/日志指标 -> 关机（保留实例以便复用）。
 """
 import json
-import time
-from autodl.config import load_config
+
+from autodl import tasks
+from autodl.config import load_config, require_token
 from autodl.core import Context
 
-CONFIG_YAML = {json.dumps(e.get("config_yaml") or "", ensure_ascii=False)}
-COMMAND = {json.dumps(command, ensure_ascii=False)}
-TASK_SCRIPT = {json.dumps(val if mode == "script_text" else "", ensure_ascii=False)}
-
 cfg = load_config()
-# —— 实例规格（来自实验定义，可改）——
-cfg.gpu_spec_uuid = {json.dumps(pref.get("gpu_spec_uuid") or cfg.gpu_spec_uuid)}
-cfg.req_gpu_amount = {_int(pref.get("req_gpu_amount"), 1)}
-cfg.expand_disk_gb = {_int(pref.get("expand_disk_gb"), cfg.expand_disk_gb)}
-cfg.image_uuid = {json.dumps(pref.get("image_uuid") or cfg.image_uuid)}
-if {json.dumps(pref.get("region") or "")}:
-    cfg.data_center_list = [{json.dumps(pref.get("region") or "")}]
+require_token(cfg)
+# —— 实例规格（来自实验定义，可改；未列出的用 autodl.yaml 默认）——
+{override_block}
 
 ctx = Context(cfg)
-uuid, snap = ctx.ensure_instance()
-print("实例:", uuid)
-key = ctx.ssh.ensure_key_access(snap, uuid)
-
-wd = {json.dumps(wd)}
-if CONFIG_YAML:
-    ctx.ssh.run(snap, "mkdir -p " + wd, uuid)
-    import base64
-    b64 = base64.b64encode(CONFIG_YAML.encode()).decode()
-    ctx.ssh.run(snap, "echo " + b64 + " | base64 -d > " + wd + "/config.yaml", uuid)
-
-run_id = "{slug}-" + str(int(time.time()))
-if TASK_SCRIPT:
-    out, err, code = ctx.ssh.run_script(snap, TASK_SCRIPT, run_id, uuid)
-else:
-    out, err, code = ctx.ssh.run(snap, COMMAND, uuid)
-print(out)
-if err.strip():
-    print("[stderr]", err)
-print("退出码:", code)
-
-# 拉回 metrics.json（实验把指标写到 {wd}/metrics.json）
-m, _e, _c = ctx.ssh.run(snap, "cat " + wd + "/metrics.json 2>/dev/null || true", uuid)
-if m.strip():
-    print("指标:", m)
-
-ctx.power_off_with_cost(uuid)  # 关机省 GPU 费；下次 ensure_instance 自动开机复用
+res = tasks.submit(
+    ctx,
+    mode={json.dumps(e["exec_mode"])},
+    value={json.dumps(e["exec_value"], ensure_ascii=False)},
+    name={json.dumps(name, ensure_ascii=False)},
+    config_yaml={json.dumps(e.get("config_yaml") or "", ensure_ascii=False)} or None,
+    metrics_spec={json.dumps(spec, ensure_ascii=False)},
+    experiment_id={json.dumps(e["experiment_id"], ensure_ascii=False)},
+    tag={json.dumps(tag, ensure_ascii=False)} or None,
+    teardown="power_off",  # 跑完关机省 GPU 费（下次自动开机复用）；要彻底释放改成 "release"
+    stream=lambda chunk: print(chunk, end="", flush=True),
+)
+print("退出码:", res["exit_code"])
+metrics = ctx.reg.get_metrics(res["run_id"])
+if metrics:
+    print("指标:", json.dumps(metrics, ensure_ascii=False))
 '''
 
 

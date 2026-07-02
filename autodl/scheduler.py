@@ -1,8 +1,9 @@
 """批量并行调度器：把 N 个任务铺到至多 max_parallel 台实例上跑。
 
 - 每个 worker 独占一台实例，从共享队列里取任务跑，一个跑完取下一个（实例复用）。
-- 任务结果记入 registry 的 runs 表（run_id = "<batch_id>:<job_id>"），支持 resume（已成功的跳过）。
-- on_finish 控制收尾：release（释放）/ power_off（关机保留）/ keep（不动）。
+- 任务执行/记台账/抓指标走 tasks.run_foreground（与 CLI run、web 同一条管线），
+  run_id = "<batch_id>:<job_id>"，支持 resume（已成功的跳过）。
+- 收尾统一走 Context.finish_instance：release（释放）/ power_off（关机保留）/ keep（不动）。
 - 并发安全：队列用 queue.Queue；registry 每次操作独立 sqlite 连接（WAL+busy_timeout）。
   worker 各自管自己的实例，不碰单值 active 实例，避免互相打架。
 """
@@ -10,71 +11,28 @@ from __future__ import annotations
 
 import queue
 import threading
-import time
 from concurrent.futures import ThreadPoolExecutor
 
+from . import tasks
 from .errors import AutoDLError, SSHUnavailable
 
 
-def _safe_power_off(ctx, uuid, log, widx):
-    try:
-        ctx.api.power_off(uuid)
-        ctx.reg.upsert_instance(uuid, status_cached="shutdown")
-        return True
-    except AutoDLError as e:
-        if log:
-            log(f"[w{widx}] ⚠️ 关机 {uuid} 失败: {e}")
-        return False
-
-
-def _safe_release(ctx, uuid, log, widx, retries=3):
-    """尽力释放：先关机，再带重试地 release。彻底失败不静默——保留 registry 记录并显著告警。"""
-    _safe_power_off(ctx, uuid, log, widx)
-    for a in range(retries):
-        time.sleep(15 if a == 0 else 8)  # 给关机留时间，release 前需已 shutdown
-        try:
-            ctx.api.release(uuid)
-            ctx.reg.remove_instance(uuid)
-            if log:
-                log(f"[w{widx}] 实例 {uuid} 已释放")
-            return True
-        except AutoDLError as e:
-            if log:
-                log(f"[w{widx}] release {uuid} 第{a + 1}/{retries}次失败: {e}")
-    # 保留 registry 记录（带 tags），便于事后 `autodl stop-all --release` 兜底
-    if log:
-        log(f"[w{widx}] ⚠️⚠️ 实例 {uuid} 释放失败、仍在计费！请尽快 `autodl stop-all --release` 或去控制台处理。")
-    return False
-
-
-def _finish_instance(ctx, uuid, on_finish, log, widx):
-    if on_finish == "keep":
-        return
-    if on_finish == "release":
-        _safe_release(ctx, uuid, log, widx)
-    else:  # power_off
-        _safe_power_off(ctx, uuid, log, widx)
-
-
 def _run_job(ctx, snap, uuid, job, batch_id, retries, log, widx):
+    """跑一个 job（记台账 + 重试 + 抓指标都在 tasks.run_foreground 里）。返回退出码。"""
     rid = f"{batch_id}:{job['id']}"
-    # 开始时记一次（正确的 started_at，重试不重置）；结束时 finish_run 一次
-    ctx.reg.record_run(rid, uuid, {k: job.get(k) for k in ("command", "id")}, "(sync)", "", "")
-    attempts = retries + 1
-    code, err = None, ""
-    for a in range(attempts):
-        try:
-            if job.get("script_text"):
-                _out, err, code = ctx.ssh.run_script(snap, job["script_text"], rid.replace(":", "_"), uuid)
-            else:
-                _out, err, code = ctx.ssh.run(snap, job["command"], uuid)
-        except SSHUnavailable as e:
-            code, err = -1, str(e)
-        if code == 0:
-            break
-        if log and a + 1 < attempts:
-            log(f"[w{widx}] job {job['id']} 第{a+1}次失败(code={code})，重试")
-    ctx.reg.finish_run(rid, code if code is not None else -1)
+    wlog = (lambda m: log(f"[w{widx}] {m}")) if log else None
+    try:
+        res = tasks.run_foreground(
+            ctx, snap, uuid, mode=job["mode"], value=job["value"], run_id=rid,
+            name=job["id"], retries=retries, tag=batch_id,
+            config_extra={"script": job["display"]} if job.get("display") else None,
+            log=wlog,
+        )
+        code = res["exit_code"]
+    except SSHUnavailable as e:
+        code = -1
+        if wlog:
+            wlog(f"job {job['id']} SSH 失败: {e}")
     if log:
         log(f"[w{widx}] job {job['id']} -> exit {code}")
     return code
@@ -107,12 +65,13 @@ def run_batch(ctx, jobs, max_parallel=2, on_finish="release", select_region=True
 
     def worker(widx):
         uuid, snap = None, None
+        wlog = (lambda m: log(f"[w{widx}] {m}")) if log else None
         try:
             try:
                 if select_region:
                     with create_lock:  # 选区与创建之间不被其它 worker 插入
                         region = ctx.select_region(log=None)
-                        uuid = ctx.api.create_in_region([region]) if region else ctx.api.create()
+                        uuid = ctx.api.create(data_center_list=[region] if region else None)
                 else:
                     uuid = ctx.api.create()
                 with clock:
@@ -126,8 +85,8 @@ def run_batch(ctx, jobs, max_parallel=2, on_finish="release", select_region=True
             except AutoDLError as e:
                 if log:
                     log(f"[w{widx}] 创建实例失败，放弃该 worker: {e}")
-                if uuid:  # 创建成功但 wait 失败 → 尽力释放（power_off/release 各自重试，不静默）
-                    _safe_release(ctx, uuid, log, widx)
+                if uuid:  # 创建成功但 wait 失败 → 尽力释放（失败会显著告警，不静默）
+                    ctx.finish_instance(uuid, "release", log=wlog)
                 return
             while True:
                 try:
@@ -146,7 +105,7 @@ def run_batch(ctx, jobs, max_parallel=2, on_finish="release", select_region=True
                     q.task_done()
         finally:
             if uuid:
-                _finish_instance(ctx, uuid, on_finish, log, widx)
+                ctx.finish_instance(uuid, on_finish, log=wlog)
 
     n_workers = min(max_parallel, len(pending)) if pending else 0
     if n_workers:
@@ -162,7 +121,7 @@ def run_batch(ctx, jobs, max_parallel=2, on_finish="release", select_region=True
                 to_clean = list(created)
             for u in to_clean:
                 if ctx.api.status_or_none(u) not in (None, "removed"):
-                    _safe_release(ctx, u, log, "X")
+                    ctx.finish_instance(u, "release", log=log)
             raise
 
     # 没被消费的（worker 全部创建失败时）标记 not_run

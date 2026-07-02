@@ -47,10 +47,11 @@ uv run python -m autodl run --instance pro-xxxxxxxx \
     --remote-script ~/proj/submit_exec.sh --down
 ```
 
-- `--remote-script` 跑的是**实例上已存在**的脚本，不上传；stdout/stderr/退出码会原样返回。
+- `--remote-script` 跑的是**实例上已存在**的脚本，不上传；`~` 会正确展开为 `$HOME`。
+- 前台任务**实时回显**输出（不再憋到跑完一次性打印），并且**记入本地台账、自动抓取指标**（`metrics.json` + 日志正则），与 web 大盘同一套数据。
 - `--down` 跑完只关机（停 GPU 计费、保留磁盘与环境）；**下次再 `run --instance` 会自动开机复用**。
 - 想彻底停止计费用 `--release`（连磁盘费一起停，但环境会随实例释放而丢失，必要时先 `image/save`）。
-- 长任务（数小时）加 `--background`，立即返回 `run_id`，之后用 `autodl logs --run-id <id>` 看进度与退出码。
+- 长任务（数小时）加 `--background`，立即返回 `run_id`（自动生成唯一 id，不会同秒撞车），之后用 `autodl logs --run-id <id>` 看进度、退出码与指标。`--background` 不能与 `--down/--release` 同用（后台任务结束时机未知），跑完自行 `autodl down`。
 
 `run` 的三种执行方式（互斥）：
 - `--remote-script <实例上的路径>`：跑实例已有脚本（你的主要用法）
@@ -112,16 +113,18 @@ uv run autodl web                         # 默认 http://127.0.0.1:8848
 
 **指标怎么记**:在「要抓取的指标」里声明 `ASR`、`Accuracy` 等(来源 `auto`/`json键`/`日志正则`);任务完成时后端从实例的 `数据盘/metrics.json` 与**运行日志(正则)**自动抓取入库。`metrics.json` 顶层标量是最终指标,可选 `"series":[{"step":1,"loss":0.5},…]` 记**趋势曲线**;也可在运行详情里手动填 JSON(含 `"_step":N` 记曲线点)或 `POST /api/runs/<run_id>/metrics`。
 
-**生成 submit 脚本**:每个实验可一键生成一个独立可运行的 `*_submit.py`(参考旧 `submit.py`,基于 `autodl` 包):创建/复用实例 → 写 `config.yaml` → 跑实验 → 拉回 `metrics.json` → 关机。直接 `python xxx_submit.py` 即可。
+**生成 submit 脚本**:每个实验可一键生成一个独立可运行的 `*_submit.py`(只是 `autodl.tasks.submit()` 的参数壳):余额护栏 → 创建/复用实例 → 写 `config.yaml` → 跑实验(实时回显、记入本地台账) → 抓指标 → 关机。直接 `python xxx_submit.py` 即可。
 
 后端是 FastAPI,所有能力复用 CLI 那套实例/SSH/台账逻辑;前端是零构建单页(原生 JS + Chart.js)。`gpu_spec_uuid` ↔ GPU 型号用的是官方文档的固定表(无枚举接口);AutoDL 库存只给「区域 × 型号」的空闲/总数,「单机 GPU 数量」是创建选项(1–4)、无按数量细分的查询。
 
 ## 设计要点
 
+- **统一任务管线（`autodl/tasks.py`）**：CLI `run`、`batch` 调度器、web 后端、生成的提交脚本、`submit.py` 全部走同一套"构造命令 → 执行 → 记台账 → 抓指标 → 收尾"，不再各写一遍。每次运行前会先清掉实例上的旧 `metrics.json`，避免上一轮指标被算到本轮头上。
+- **统一收尾（`Context.finish_instance`）**：`keep / power_off / release` 一处实现；release 前**轮询等实例真正 shutdown**（替代各处的盲睡 15 秒），release 返回业务失败码也算失败并重试，最终失败会显著告警（绝不静默泄漏计费）。
 - **HTTP 稳健层**：超时 + 对只读接口指数退避重试；`create`/`power_*`/`release` 等写接口**绝不自动重试**，避免重复开机/重复扣费。
 - **SSH 连接层**：失败按根因分类（实例已关机 / 跳板不通 / 端口未就绪 / 认证失败），不会把"网络不通"误判成"实例已关机"。
 - **凭据安全**：首连后注入本地 SSH 公钥走免密，`root_password` 只在内存用一次，不进命令行/日志。
-- **本地台账**：`.autodl/registry.db`（带文件锁的 SQLite）记录实例与任务，替代旧的单值 `.instance_uuid`。
+- **本地台账**：`.autodl/registry.db`（带文件锁的 SQLite）记录实例与任务（前台/后台/批量/网页运行都进同一张 runs 表），替代旧的单值 `.instance_uuid`。
 - **GET 接口走 query string**：AutoDL 网关会丢弃 GET 的 body（这是早期踩过的坑）。
 
-> 旧的一体脚本 `submit.py` 仍可用（`uv run python submit.py`），新功能请用 `autodl` 包。
+> 旧入口 `submit.py` 仍可用（`uv run python submit.py`），现在是包之上的薄封装：配置读 `autodl.yaml`，等价于 `autodl run --script <脚本> --down`。日常请直接用 `autodl` CLI。

@@ -10,6 +10,10 @@ class ConfigError(AutoDLError):
     """配置缺失或非法。"""
 
 
+class InsufficientBalance(AutoDLError):
+    """余额低于安全阈值，拒绝开机/提交任务。"""
+
+
 class APIError(AutoDLError):
     """AutoDL API 返回 code != Success，或 HTTP 层错误。"""
 

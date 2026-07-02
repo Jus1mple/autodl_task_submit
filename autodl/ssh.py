@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import os
+import posixpath
 import re
 import socket
 import subprocess
@@ -111,15 +112,12 @@ class SSHManager:
         raise self._classify_failure(last, instance_uuid)
 
     # ---------------- 同步执行 ----------------
-    def run(self, snapshot, command, instance_uuid=None):
-        """同步执行一条命令，返回 (stdout, stderr, exit_code)。"""
+    def run(self, snapshot, command, instance_uuid=None, stream=None):
+        """同步执行一条命令，返回 (stdout, stderr, exit_code)。
+        stream: 可选回调，边执行边收到输出块（长任务实时回显）；stdout/stderr 都会喂给它。"""
         client = self.connect(snapshot, instance_uuid)
         try:
-            _in, out, err = client.exec_command(command)
-            so = out.read().decode("utf-8", "replace")
-            se = err.read().decode("utf-8", "replace")
-            code = out.channel.recv_exit_status()
-            return so, se, code
+            return _exec(client, command, stream)
         finally:
             client.close()
 
@@ -185,9 +183,27 @@ class SSHManager:
             pass
         return alias
 
+    # ---------------- 文件写入 ----------------
+    def write_file(self, snapshot, path, content, instance_uuid=None):
+        """把文本写到实例上的指定路径（自动建父目录）。"""
+        client = self.connect(snapshot, instance_uuid)
+        sftp = None
+        try:
+            sftp = client.open_sftp()
+            parent = posixpath.dirname(path)
+            if parent:
+                _mkdirs(sftp, parent)
+            with sftp.open(path, "w") as f:
+                f.write(content)
+        finally:
+            if sftp:
+                sftp.close()
+            client.close()
+
     # ---------------- 后台非阻塞执行 ----------------
-    def run_script(self, snapshot, script_text, run_id, instance_uuid=None):
-        """上传一段脚本到数据盘并**同步**执行，返回 (stdout, stderr, exit_code)。"""
+    def run_script(self, snapshot, script_text, run_id, instance_uuid=None, prelude="", stream=None):
+        """上传一段脚本到数据盘并**同步**执行，返回 (stdout, stderr, exit_code)。
+        prelude: 在脚本前于同一 shell 里执行的命令（如清理旧 metrics.json），以 ';' 结尾。"""
         run_id = _safe_run_id(run_id)
         wd = self.cfg.remote_workdir
         task = f"{wd}/task_{run_id}.sh"
@@ -199,17 +215,13 @@ class SSHManager:
             with sftp.open(task, "w") as f:
                 f.write(script_text)
             sftp.close(); sftp = None
-            _in, out, err = client.exec_command(f"bash {task}")
-            so = out.read().decode("utf-8", "replace")
-            se = err.read().decode("utf-8", "replace")
-            code = out.channel.recv_exit_status()
-            return so, se, code
+            return _exec(client, f"{prelude}bash {task}", stream)
         finally:
             if sftp:
                 sftp.close()
             client.close()
 
-    def run_background_command(self, snapshot, command, run_id, instance_uuid=None):
+    def run_background_command(self, snapshot, command, run_id, instance_uuid=None, prelude=""):
         """把任意命令拉起为脱离会话的后台进程，立即返回 {pid, log, exit_file, workdir}。"""
         run_id = _safe_run_id(run_id)
         wd = self.cfg.remote_workdir
@@ -225,7 +237,8 @@ class SSHManager:
             _mkdirs(sftp, logs)
             sftp.close(); sftp = None
             # setsid 完全脱离会话；exit code 落 exit_file；pid 落 pid_file。路径一律转义。
-            inner = f"{command} > {_shq(log_file)} 2>&1; echo $? > {_shq(exit_file)}"
+            # prelude 在重定向之外执行，exit_file 只记任务本体的退出码。
+            inner = f"{prelude}{command} > {_shq(log_file)} 2>&1; echo $? > {_shq(exit_file)}"
             launch = (
                 f"setsid bash -c {_shq(inner)} "
                 f"</dev/null >/dev/null 2>&1 & echo $! > {_shq(pid_file)}; cat {_shq(pid_file)}"
@@ -241,7 +254,7 @@ class SSHManager:
             client.close()
         return {"pid": pid, "log": log_file, "exit_file": exit_file, "workdir": wd}
 
-    def run_background(self, snapshot, script_text, run_id, instance_uuid=None):
+    def run_background(self, snapshot, script_text, run_id, instance_uuid=None, prelude=""):
         """上传一段脚本到数据盘并后台执行。返回 {pid, log, exit_file, workdir}。"""
         run_id = _safe_run_id(run_id)
         wd = self.cfg.remote_workdir
@@ -259,7 +272,7 @@ class SSHManager:
                 sftp.close()
             client.close()
         return self.run_background_command(snapshot, f"cd {_shq(wd)} && bash {_shq(task_file)}",
-                                           run_id, instance_uuid)
+                                           run_id, instance_uuid, prelude=prelude)
 
     def poll(self, snapshot, run_meta, instance_uuid=None):
         """返回 ('running'|'done', exit_code|None)。"""
@@ -348,6 +361,31 @@ class SSHManager:
 
 
 # ---------------- 小工具 ----------------
+def _exec(client, command, stream=None):
+    """在已连接的 client 上执行命令。stream=None 时一次性读完；
+    否则边跑边把输出块喂给 stream 回调（stdout/stderr 交错，返回值仍分开）。"""
+    _in, out, err = client.exec_command(command)
+    if stream is None:
+        so = out.read().decode("utf-8", "replace")
+        se = err.read().decode("utf-8", "replace")
+        return so, se, out.channel.recv_exit_status()
+    chan = out.channel
+    so_parts, se_parts = [], []
+    while True:
+        got = False
+        while chan.recv_ready():
+            chunk = chan.recv(4096).decode("utf-8", "replace")
+            so_parts.append(chunk); stream(chunk); got = True
+        while chan.recv_stderr_ready():
+            chunk = chan.recv_stderr(4096).decode("utf-8", "replace")
+            se_parts.append(chunk); stream(chunk); got = True
+        if chan.exit_status_ready() and not chan.recv_ready() and not chan.recv_stderr_ready():
+            break
+        if not got:
+            time.sleep(0.1)
+    return "".join(so_parts), "".join(se_parts), chan.recv_exit_status()
+
+
 def _shq(s: str) -> str:
     """POSIX shell 单引号转义。"""
     return "'" + s.replace("'", "'\\''") + "'"

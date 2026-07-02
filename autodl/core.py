@@ -17,6 +17,15 @@ _REUSABLE_AFTER_POWERON = {"shutdown", "power_off"}
 _TRANSIENT_BOOTING = {"starting", "sys_volume_creating"}
 
 
+def billing_class(status):
+    """实例状态 → 计费口径（CLI 与 web 共用的展示逻辑）。"""
+    if status == "running":
+        return "带卡计费"
+    if status in ("shutdown", "power_off", "shutting_down"):
+        return "仅磁盘计费"
+    return status or "?"
+
+
 class Context:
     def __init__(self, cfg):
         self.cfg = cfg
@@ -77,16 +86,10 @@ class Context:
                 self.reg.set_active(None)
 
             # 新建
-            if select_region:
-                region = self.select_region(log=log)
-                if region:
-                    uuid = self.api.create_in_region([region])
-                else:
-                    if log:
-                        log("  偏好区域均无空闲，回退自动调度创建。")
-                    uuid = self.api.create()
-            else:
-                uuid = self.api.create()
+            region = self.select_region(log=log) if select_region else None
+            if select_region and not region and log:
+                log("  偏好区域均无空闲，回退自动调度创建。")
+            uuid = self.api.create(data_center_list=[region] if region else None)
             if log:
                 log(f"实例已创建: {uuid}")
             self.reg.upsert_instance(uuid, name=self.cfg.instance_name, status_cached="creating")
@@ -225,3 +228,46 @@ class Context:
                     log(f"  本段约花费 ¥{spent:.2f}（余额差分粗估，多实例并发时不准）")
         except APIError:
             pass
+
+    # ---------------- 统一收尾 ----------------
+    def finish_instance(self, uuid, mode="power_off", log=print, release_retries=3):
+        """收尾一台实例：keep（不动）/ power_off（关机保留复用）/ release（关机并彻底释放）。
+        替代散落各处的 power_off + sleep(15) + release 盲等：release 前轮询等实例真正
+        shutdown，release 的业务失败码也算失败并重试。返回 True=达成目标；
+        False=失败（实例可能仍在计费，已显著告警，绝不静默）。"""
+        if mode == "keep":
+            return True
+        try:
+            self.power_off_with_cost(uuid, log=log)
+        except AutoDLError as e:
+            if log:
+                log(f"  ⚠️ 关机 {uuid} 失败: {e}")
+            if mode == "power_off":
+                if log:
+                    log(f"  ⚠️ 实例 {uuid} 可能仍在计费，请 `autodl stop-all` 或去控制台处理")
+                return False
+        if mode == "power_off":
+            return True
+        # release：等实例真正 shutdown（release 的前置条件），带重试
+        for attempt in range(release_retries):
+            st = self._wait_until(uuid, _REUSABLE_AFTER_POWERON, None, max_tries=10, interval=3)
+            if st in (None, "removed"):
+                break  # 实例已不存在，视为释放完成
+            try:
+                r = self.api.release(uuid)
+            except AutoDLError as e:
+                r = {"code": "Error", "msg": str(e)}
+            if log:
+                log(f"  释放 {uuid}: {r.get('code')} {r.get('msg') or ''}")
+            if r.get("code") == "Success":
+                break
+            time.sleep(5)
+        else:
+            if log:
+                log(f"  ⚠️⚠️ 实例 {uuid} 释放失败、仍在计费！"
+                    f"请尽快 `autodl stop-all --release` 或去控制台处理。")
+            return False
+        self.reg.remove_instance(uuid)
+        if self.reg.get_active() == uuid:
+            self.reg.set_active(None)
+        return True

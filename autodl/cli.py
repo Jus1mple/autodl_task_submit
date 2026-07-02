@@ -19,17 +19,15 @@ from __future__ import annotations
 
 import argparse
 import json
-import shlex
 import sys
-import time
 from pathlib import Path
 
 import yaml
 
-from . import monitor, scheduler
+from . import monitor, scheduler, tasks
 from .config import load_config, require_token
-from .core import Context
-from .errors import APIError, AutoDLError, ConfigError, SSHUnavailable
+from .core import Context, billing_class
+from .errors import APIError, AutoDLError, ConfigError, InsufficientBalance, SSHUnavailable
 
 EXIT_OK, EXIT_USAGE, EXIT_BALANCE, EXIT_STOCK, EXIT_SSH, EXIT_TASK, EXIT_ERR = 0, 2, 3, 4, 5, 6, 1
 
@@ -43,12 +41,10 @@ def _confirm(prompt, assume_yes):
         return False
 
 
-def _running_billing_class(status):
-    if status == "running":
-        return "带卡计费"
-    if status in ("shutdown", "power_off", "shutting_down"):
-        return "仅磁盘计费"
-    return status or "?"
+def _print_chunk(chunk):
+    """前台任务的实时回显（stdout/stderr 交错原样输出）。"""
+    sys.stdout.write(chunk)
+    sys.stdout.flush()
 
 
 # ---------------- 命令实现 ----------------
@@ -91,7 +87,7 @@ def cmd_status(ctx, args):
         rows.append({
             "instance_uuid": uid,
             "status": st,
-            "billing": _running_billing_class(st),
+            "billing": billing_class(st),
             "region": it.get("region_sign"),
             "active": uid == active,
         })
@@ -128,7 +124,7 @@ def cmd_stop_all(ctx, args):
 
 
 def cmd_up(ctx, args):
-    _balance_guard(ctx)
+    tasks.check_balance(ctx)
     uuid, snap = ctx.ensure_instance(select_region=args.select_region)
     key = ctx.ssh.ensure_key_access(snap, uuid)
     alias = ctx.ssh.write_ssh_config(snap, identity_file=key or None)
@@ -156,14 +152,8 @@ def cmd_down(ctx, args):
     if not _confirm("确认？", args.yes):
         print("已取消。")
         return EXIT_OK
-    ctx.power_off_with_cost(uuid)
-    if args.release:
-        time.sleep(15)
-        r = ctx.api.release(uuid)
-        print(f"  释放: {r.get('code')} {r.get('msg')}")
-        ctx.reg.remove_instance(uuid)
-        ctx.reg.set_active(None)
-    return EXIT_OK
+    ok = ctx.finish_instance(uuid, "release" if args.release else "power_off")
+    return EXIT_OK if ok else EXIT_ERR
 
 
 def cmd_use(ctx, args):
@@ -176,88 +166,40 @@ def cmd_use(ctx, args):
 
 
 def cmd_run(ctx, args):
-    modes = [bool(args.script), bool(args.remote_script), bool(args.remote)]
-    if sum(modes) != 1:
+    chosen = [(m, v) for m, v in (("script", args.script),
+                                  ("remote_script", args.remote_script),
+                                  ("remote", args.remote)) if v]
+    if len(chosen) != 1:
         print("请且仅指定一种执行方式：--script（上传本地脚本）/ "
               "--remote-script（实例上已有的脚本）/ --remote（任意远端命令）", file=sys.stderr)
         return EXIT_USAGE
-    _balance_guard(ctx)
-
-    # 解析目标实例：--instance 指定已有实例；否则复用活动实例 / 新建
+    mode, value = chosen[0]
+    if args.background and (args.down or args.release):
+        print("--background 与 --down/--release 不能同时用（后台任务结束时机未知）；"
+              "请任务完成后自行 `autodl down`。", file=sys.stderr)
+        return EXIT_USAGE
     if args.instance:
-        ctx.use_instance(args.instance, log=None)
-        uuid = args.instance
-        snap = ctx.ensure_specific(uuid)
-    else:
-        uuid, snap = ctx.ensure_instance(select_region=args.select_region)
+        ctx.use_instance(args.instance, log=None)  # 顺手登记为活动实例，之后 logs/down 默认用它
 
-    # 构造要执行的命令（remote 模式不上传，直接跑实例上已有的脚本/命令）
-    if args.remote_script:
-        rs = args.remote_script
-        command = f"cd {shlex.quote(str(Path(rs).parent) or '.')} && bash {shlex.quote(Path(rs).name)}"
-        descr = {"remote_script": rs}
-    elif args.remote:
-        command = args.remote
-        descr = {"remote": args.remote}
-    else:
-        command = None
-        descr = {"script": args.script}
-
-    rc = EXIT_OK
-    try:
-        if args.background:
-            run_id = args.name or f"run-{int(time.time())}"
-            try:
-                if command is None:  # 上传本地脚本后台跑
-                    meta = ctx.ssh.run_background(snap, open(args.script, encoding="utf-8").read(), run_id, uuid)
-                else:                # 跑实例上已有的脚本/命令
-                    meta = ctx.ssh.run_background_command(snap, command, run_id, uuid)
-            except (SSHUnavailable, OSError) as e:
-                # 实例已就绪（可能是本次刚创建的），但任务没起来——绝不能静默放任计费
-                print(f"⚠️ 后台任务启动失败: {e}", file=sys.stderr)
-                print(f"⚠️ 实例 {uuid} 已就绪但任务未启动、仍在计费！"
-                      f"请尽快 `autodl down`（或 `autodl down --release`）。", file=sys.stderr)
-                return EXIT_SSH
-            ctx.reg.record_run(run_id, uuid, descr, meta["log"], meta["exit_file"], meta["pid"])
-            print(f"后台任务已启动: run_id={run_id} pid={meta['pid']}")
-            print(f"  日志: {meta['log']}")
-            print(f"  查看进度: autodl logs --run-id {run_id}")
-            # 后台模式下不在这里关机（任务还在跑）；由 logs 完成后用户决定 down
-            return EXIT_OK
-
-        # 前台同步：等任务结束、拿到结果
-        if command is None:
-            out, err, code = _run_inline(ctx, snap, open(args.script, encoding="utf-8").read(), uuid)
-        else:
-            print(f"执行: {command}")
-            out, err, code = ctx.ssh.run(snap, command, uuid)
-        print("\n======== 任务输出 ========")
-        print(out)
-        print("==========================")
-        if err.strip():
-            print(f"[stderr]\n{err}")
-        if code != 0:
-            print(f"[远程退出码] {code}")
-            rc = EXIT_TASK
-    finally:
-        # 执行完按需关机/释放（前台模式才在此收尾）
-        if not args.background:
-            if args.release:
-                ctx.power_off_with_cost(uuid)
-                time.sleep(15)
-                r = ctx.api.release(uuid)
-                print(f"  释放: {r.get('code')} {r.get('msg')}")
-                ctx.reg.remove_instance(uuid)
-                ctx.reg.set_active(None)
-            elif args.down:
-                ctx.power_off_with_cost(uuid)
-                print("  已关机（保留实例，下次 autodl up / run --instance 即可再开机复用）")
-    return rc
-
-
-def _run_inline(ctx, snap, script_text, uuid):
-    # 同步执行：上传脚本到数据盘再跑
-    return ctx.ssh.run_script(snap, script_text, "inline", uuid)
+    teardown = "release" if args.release else ("power_off" if args.down else "keep")
+    res = tasks.submit(
+        ctx, mode=mode, value=value, instance=args.instance,
+        select_region=args.select_region, background=args.background,
+        teardown=teardown, run_id=args.name,
+        stream=None if (args.json or args.background) else _print_chunk,
+    )
+    if args.background:
+        print(f"后台任务已启动: run_id={res['run_id']} pid={res['pid']}")
+        print(f"  日志: {res['log']}")
+        print(f"  查看进度: autodl logs --run-id {res['run_id']}")
+        # 后台模式下不在这里关机（任务还在跑）；完成后由用户决定 down
+        return EXIT_OK
+    if args.json:
+        print(json.dumps({k: res[k] for k in ("run_id", "exit_code", "stdout", "stderr", "instance")},
+                         ensure_ascii=False))
+    elif res["exit_code"] != 0:
+        print(f"[远程退出码] {res['exit_code']}")
+    return EXIT_OK if res["exit_code"] == 0 else EXIT_TASK
 
 
 def cmd_logs(ctx, args):
@@ -266,22 +208,26 @@ def cmd_logs(ctx, args):
         if not run:
             print(f"未找到 run: {args.run_id}")
             return EXIT_USAGE
-        uuid, log_file, exit_file = run["instance_uuid"], run["log_path"], run["exit_file"]
     else:
         runs = ctx.reg.list_runs()
         if not runs:
             print("没有记录的后台任务。")
             return EXIT_OK
         run = runs[-1]
-        uuid, log_file, exit_file = run["instance_uuid"], run["log_path"], run["exit_file"]
         print(f"(最近任务 run_id={run['run_id']})")
-    snap = ctx.api.snapshot(uuid)
-    # 探活 + 退出码
-    state, code = ctx.ssh.poll(snap, {"pid": run["pid"], "exit_file": exit_file}, uuid)
-    print(ctx.ssh.tail(snap, log_file, lines=args.lines, instance_uuid=uuid))
-    print(f"--- 状态: {state}" + (f" 退出码={code}" if code is not None else "") + " ---")
-    if state == "done" and code is not None:
-        ctx.reg.finish_run(run["run_id"], code)
+    info = tasks.refresh_run(ctx, run, lines=args.lines)
+    if info["log"]:
+        print(info["log"])
+    if info["note"]:
+        print(f"({info['note']})")
+    cur = ctx.reg.get_run(run["run_id"]) or run
+    line = f"--- 状态: {cur['status']}"
+    if cur.get("exit_code") is not None:
+        line += f" 退出码={cur['exit_code']}"
+    print(line + " ---")
+    m = ctx.reg.get_metrics(run["run_id"])
+    if m:
+        print("指标: " + json.dumps(m, ensure_ascii=False))
     return EXIT_OK
 
 
@@ -347,7 +293,7 @@ def cmd_balance_watch(ctx, args):
 
 
 def cmd_batch(ctx, args):
-    _balance_guard(ctx)
+    tasks.check_balance(ctx)
     with open(args.file, encoding="utf-8") as f:
         spec = yaml.safe_load(f)
     if isinstance(spec, dict) and "jobs" in spec:
@@ -356,13 +302,16 @@ def cmd_batch(ctx, args):
     for j in spec:
         jid = str(j["id"])
         if j.get("remote_script"):
-            rs = j["remote_script"]
-            cmd = f"cd {shlex.quote(str(Path(rs).parent) or '.')} && bash {shlex.quote(Path(rs).name)}"
-            jobs.append({"id": jid, "command": cmd})
+            jobs.append({"id": jid, "mode": "remote_script", "value": j["remote_script"]})
         elif j.get("remote"):
-            jobs.append({"id": jid, "command": j["remote"]})
+            jobs.append({"id": jid, "mode": "remote", "value": j["remote"]})
         elif j.get("script"):
-            jobs.append({"id": jid, "script_text": open(j["script"], encoding="utf-8").read()})
+            try:
+                text = Path(j["script"]).expanduser().read_text(encoding="utf-8")
+            except OSError as e:
+                print(f"job {jid} 脚本读取失败: {e}", file=sys.stderr)
+                return EXIT_USAGE
+            jobs.append({"id": jid, "mode": "script_text", "value": text, "display": j["script"]})
         else:
             print(f"job {jid} 缺少 remote_script/remote/script 之一", file=sys.stderr)
             return EXIT_USAGE
@@ -370,7 +319,8 @@ def cmd_batch(ctx, args):
     if args.dry_run:
         print(f"[dry-run] 批次 {batch_id}: {len(jobs)} 任务，并发 {args.max_parallel}，on_finish={args.on_finish}")
         for j in jobs:
-            print(f"  - {j['id']}: {j.get('command', '<上传脚本>')}")
+            preview = j.get("display") or (tasks.build_command(j["mode"], j["value"]) or "<上传脚本>")
+            print(f"  - {j['id']}: {preview}")
         return EXIT_OK
     results = scheduler.run_batch(
         ctx, jobs, max_parallel=args.max_parallel, on_finish=args.on_finish,
@@ -399,18 +349,6 @@ def cmd_web(ctx, args):
     print(f"启动实验大盘: http://{args.host}:{args.port}  （Ctrl-C 退出）")
     serve(host=args.host, port=args.port, cfg=ctx.cfg)
     return EXIT_OK
-
-
-def _balance_guard(ctx):
-    bal = ctx.api.balance_yuan()
-    if bal < ctx.cfg.min_balance_yuan:
-        raise _Exit(EXIT_BALANCE, f"余额 ¥{bal:.2f} 低于阈值 ¥{ctx.cfg.min_balance_yuan:.2f}，已中止。")
-
-
-class _Exit(Exception):
-    def __init__(self, code, message):
-        super().__init__(message)
-        self.code = code
 
 
 # ---------------- 解析器 ----------------
@@ -447,7 +385,7 @@ def build_parser():
     g.add_argument("--remote", help="在实例上直接执行的任意命令")
     sp.add_argument("--instance", help="指定要用的已有实例 uuid（默认用活动实例或新建）")
     sp.add_argument("--background", action="store_true", help="后台脱机执行（长任务用）")
-    sp.add_argument("--name", help="后台任务 run_id")
+    sp.add_argument("--name", help="run_id（默认自动生成唯一 id；前后台任务都记入台账）")
     sp.add_argument("--select-region", action="store_true", help="按库存自动选区创建")
     sp.add_argument("--down", action="store_true", help="前台任务结束后关机（保留以便复用）")
     sp.add_argument("--release", action="store_true", help="前台任务结束后释放（彻底停止计费）")
@@ -508,17 +446,26 @@ def main(argv=None):
         require_token(cfg)
         ctx = Context(cfg)
         return _DISPATCH[args.cmd](ctx, args)
-    except _Exit as e:
+    except KeyboardInterrupt:
+        print("\n已中断。", file=sys.stderr)
+        return 130
+    except InsufficientBalance as e:
         print(str(e), file=sys.stderr)
-        return e.code
+        return EXIT_BALANCE
     except SSHUnavailable as e:
         print(f"SSH 不可达: {e}", file=sys.stderr)
         return EXIT_SSH
     except ConfigError as e:
         print(f"配置错误: {e}", file=sys.stderr)
         return EXIT_USAGE
+    except ValueError as e:
+        print(f"参数错误: {e}", file=sys.stderr)
+        return EXIT_USAGE
     except AutoDLError as e:
         print(f"错误: {e}", file=sys.stderr)
+        return EXIT_ERR
+    except OSError as e:
+        print(f"IO 错误: {e}", file=sys.stderr)
         return EXIT_ERR
 
 

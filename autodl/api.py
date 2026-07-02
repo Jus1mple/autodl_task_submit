@@ -159,48 +159,12 @@ class AutoDLClient:
                           {"page_index": 1, "page_size": 100}, idempotent=True).get("list", [])
 
     # ---------------- 写操作（不自动重试） ----------------
-    def create(self):
+    def create(self, *, gpu_spec_uuid=None, req_gpu_amount=None, expand_disk_gb=None,
+               data_center_list=None, image_uuid=None, cuda_v_from=None, instance_name=None):
+        """创建实例，返回 instance_uuid。未显式给的参数回退到配置默认。"""
         c = self.cfg
         body = {
-            "req_gpu_amount": c.req_gpu_amount,
-            "expand_system_disk_by_gb": c.expand_disk_gb,
-            "gpu_spec_uuid": c.gpu_spec_uuid,
-            "image_uuid": c.image_uuid,
-            "cuda_v_from": c.cuda_v_from,
-            "instance_name": c.instance_name,
-            "start_command": "sleep infinity",
-        }
-        if c.data_center_list:
-            body["data_center_list"] = list(c.data_center_list)
-        return self._post("/api/v1/dev/instance/pro/create", body)
-
-    def create_in_region(self, data_center_list):
-        """临时指定区域创建（用于库存驱动选区，不改全局配置）。"""
-        c = self.cfg
-        body = {
-            "req_gpu_amount": c.req_gpu_amount,
-            "expand_system_disk_by_gb": c.expand_disk_gb,
-            "gpu_spec_uuid": c.gpu_spec_uuid,
-            "image_uuid": c.image_uuid,
-            "cuda_v_from": c.cuda_v_from,
-            "instance_name": c.instance_name,
-            "start_command": "sleep infinity",
-            "data_center_list": list(data_center_list),
-        }
-        return self._post("/api/v1/dev/instance/pro/create", body)
-
-    def image_save(self, instance_uuid, image_name):
-        """把实例存为私有镜像，返回 image_uuid。注意：AutoDL 无删除镜像 API，镜像会持续占存储费。"""
-        data = self._post("/api/v1/dev/instance/pro/image/save",
-                          {"instance_uuid": instance_uuid, "image_name": image_name})
-        return data.get("image_uuid") if isinstance(data, dict) else data
-
-    def create_custom(self, *, gpu_spec_uuid=None, req_gpu_amount=1, expand_disk_gb=None,
-                      data_center_list=None, image_uuid=None, cuda_v_from=None, instance_name=None):
-        """按显式参数创建实例（前端创建表单用）。未给的字段回退到配置默认。"""
-        c = self.cfg
-        body = {
-            "req_gpu_amount": int(req_gpu_amount),
+            "req_gpu_amount": int(req_gpu_amount if req_gpu_amount is not None else c.req_gpu_amount),
             "expand_system_disk_by_gb": int(expand_disk_gb if expand_disk_gb is not None else c.expand_disk_gb),
             "gpu_spec_uuid": gpu_spec_uuid or c.gpu_spec_uuid,
             "image_uuid": image_uuid or c.image_uuid,
@@ -208,9 +172,16 @@ class AutoDLClient:
             "instance_name": instance_name or c.instance_name,
             "start_command": "sleep infinity",
         }
-        if data_center_list:
-            body["data_center_list"] = list(data_center_list)
+        dcl = data_center_list if data_center_list is not None else c.data_center_list
+        if dcl:
+            body["data_center_list"] = list(dcl)
         return self._post("/api/v1/dev/instance/pro/create", body)
+
+    def image_save(self, instance_uuid, image_name):
+        """把实例存为私有镜像，返回 image_uuid。注意：AutoDL 无删除镜像 API，镜像会持续占存储费。"""
+        data = self._post("/api/v1/dev/instance/pro/image/save",
+                          {"instance_uuid": instance_uuid, "image_name": image_name})
+        return data.get("image_uuid") if isinstance(data, dict) else data
 
     def power_on(self, instance_uuid, with_gpu=True):
         # 注意：无卡(CPU)模式的 payload 取值未在文档确证，默认带卡。
