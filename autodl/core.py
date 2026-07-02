@@ -225,7 +225,8 @@ class Context:
             if before is not None:
                 spent = before - after
                 if log:
-                    log(f"  本段约花费 ¥{spent:.2f}（余额差分粗估，多实例并发时不准）")
+                    log(f"  本段余额变化 ¥{spent:.2f}（差分粗估：期间账户的其它计费——"
+                        f"其它实例/弹性部署/存储——都会算进来，仅单实例独占账户时才是本段费用）")
         except APIError:
             pass
 
