@@ -4,7 +4,7 @@ AutoDL GPU 云的 **Python 库 + 命令行工具**：开机/复用实例、传�
 
 用法对标 `huggingface-hub`：`pip install` 装完即有 `autodl` 命令，跑任务一条命令、`--json` 拿结构化数据；同一套能力也可以当库 `import autodl` 直接调。
 
-> 可视化大盘（FastAPI + 网页）**不在核心包里**，在 [`web-dashboard`](../../tree/web-dashboard) 分支单独维护——核心包保持零 web 依赖（只有 requests / paramiko / pyyaml / dotenv）。
+> **本分支（web-dashboard）= `main` 核心包 + 可视化大盘**。核心（CLI/库/提交管线）的开发都在 `main`，本分支只维护 web 部分，定期 `git merge main` 吸收核心更新。只要纯依赖请用 `main` 分支 / PyPI 包。
 
 ## 安装与配置
 
@@ -15,6 +15,20 @@ cp autodl.example.yaml autodl.yaml    # 可选：改实例规格/区域/预算/S
 ```
 
 Token 在 AutoDL 控制台 → 账号 → 设置 → 开发者 Token 获取。
+
+## 可视化实验大盘（本分支特有）
+
+```bash
+uv sync --extra web        # 或 pip install 'autodl-task-submit[web]'
+uv run autodl web          # 默认 http://127.0.0.1:8848
+```
+
+四个页面：**概览**（余额/实例/运行分布）、**实例**（GPU 型号/开关机/释放/创建表单/库存）、
+**实验**（可复用定义：标签 + YAML 配置 + 执行方式 + 指标声明；一键运行 / 生成独立 submit 脚本）、
+**大盘**（按 tag 的实验 × 指标对比）。后端 FastAPI，全部能力复用核心包的 `tasks` 管线与台账；
+前端零构建单页（原生 JS + Chart.js）。
+
+分支维护：核心改动永远先进 `main`；本分支更新方式——`git checkout web-dashboard && git merge main`。
 
 ## 命令行快速上手
 
