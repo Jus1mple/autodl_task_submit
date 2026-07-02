@@ -9,6 +9,7 @@
   down [--release]     关机当前活动实例（--release 则释放）
   run --script F [--background]  上传脚本并执行（默认前台，--background 后台脱机）
   clone / sync         在实例上克隆项目仓库 / 从 remote 更新（配合本地改码后 git push）
+  setup [--force]      按仓库依赖声明准备环境（hash 幂等，未变秒跳）
   logs [--run-id R]    查看后台任务日志 + 退出码 + 指标
   runs [--limit N]     列出台账里的运行记录（含指标）
   web [--port P]       启动可视化实验大盘（本分支特有，需 [web] 依赖）
@@ -28,7 +29,7 @@ from pathlib import Path
 
 import yaml
 
-from . import gitsync, monitor, scheduler, tasks
+from . import __version__, envsetup, gitsync, monitor, scheduler, tasks
 from .config import load_config, require_token
 from .core import Context, billing_class
 from .errors import APIError, AutoDLError, ConfigError, InsufficientBalance, SSHUnavailable
@@ -223,6 +224,32 @@ def cmd_sync(ctx, args):
     return EXIT_OK if not (res["blocked"] or res["error"]) else EXIT_ERR
 
 
+def cmd_setup(ctx, args):
+    uuid, snap = _resolve_ready(ctx, args.instance)
+    res = envsetup.run_setup(ctx, snap, uuid, dir=args.dir, force=args.force,
+                             background=args.background,
+                             stream=None if args.json else _print_chunk,
+                             log=_eprint if args.json else print)
+    if args.json:
+        out = dict(res)
+        for k in ("stdout", "stderr"):  # 安装日志可能巨大，JSON 里只留尾部
+            if isinstance(out.get(k), str) and len(out[k]) > 2000:
+                out[k] = out[k][-2000:]
+        print(json.dumps(out, ensure_ascii=False))
+    elif res.get("skipped"):
+        print(f"环境未变（{res['source']}），跳过安装。--force 可强制重装。")
+    elif res.get("background"):
+        print(f"环境安装已后台启动: run_id={res['run_id']}")
+        print(f"  进度: autodl logs --run-id {res['run_id']}")
+    elif res["exit_code"] == 0:
+        print("环境安装完成。长期复用建议固化镜像：autodl snapshot-env --name <名字>")
+    else:
+        print(f"环境安装失败 exit={res['exit_code']}", file=sys.stderr)
+    if res.get("skipped") or res.get("background"):
+        return EXIT_OK
+    return EXIT_OK if res["exit_code"] == 0 else EXIT_TASK
+
+
 def cmd_run(ctx, args):
     chosen = [(m, v) for m, v in (("script", args.script),
                                   ("remote_script", args.remote_script),
@@ -241,19 +268,31 @@ def cmd_run(ctx, args):
     logf = _eprint if args.json else print
 
     instance = args.instance
-    if args.sync:
-        # 跑之前把实例仓库更新到 remote 最新（缺仓库则按 git.repo 自动 clone）
+    if args.sync or args.setup:
+        # 跑之前先把实例上的代码/环境弄到位；任何一步失败都阻断任务（不浪费卡时）
         tasks.check_balance(ctx)
         if instance:
             uuid0, snap0 = instance, ctx.ensure_specific(instance, log=logf)
         else:
             uuid0, snap0 = ctx.ensure_instance(select_region=args.select_region, log=logf)
-        res_sync = gitsync.update(ctx, snap0, uuid0, mode=args.sync_mode)
-        if res_sync["blocked"] or res_sync["error"]:
-            _print_sync(res_sync, file=sys.stderr)
-            print("sync 未完成，已中止运行（实例保持原样）。", file=sys.stderr)
-            return EXIT_ERR
-        logf(f"sync: {res_sync['old'] or '-'} -> {res_sync['new']}  {res_sync['message']}")
+        if args.sync:
+            res_sync = gitsync.update(ctx, snap0, uuid0, mode=args.sync_mode)
+            if res_sync["blocked"] or res_sync["error"]:
+                _print_sync(res_sync, file=sys.stderr)
+                print("sync 未完成，已中止运行（实例保持原样）。", file=sys.stderr)
+                return EXIT_ERR
+            logf(f"sync: {res_sync['old'] or '-'} -> {res_sync['new']}  {res_sync['message']}")
+        if args.setup:
+            res_setup = envsetup.run_setup(ctx, snap0, uuid0,
+                                           stream=None if args.json else _print_chunk, log=logf)
+            if res_setup.get("skipped"):
+                logf(f"环境未变（{res_setup['source']}），跳过安装")
+            elif res_setup["exit_code"] != 0:
+                print(f"环境安装失败(exit={res_setup['exit_code']})，已中止运行。"
+                      f"日志: autodl logs --run-id {res_setup['run_id']}", file=sys.stderr)
+                return EXIT_TASK
+            else:
+                logf("环境安装完成")
         instance = uuid0
 
     teardown = "release" if args.release else ("power_off" if args.down else "keep")
@@ -262,7 +301,7 @@ def cmd_run(ctx, args):
         select_region=args.select_region, background=args.background,
         teardown=teardown, run_id=args.name,
         stream=None if (args.json or args.background) else _print_chunk,
-        log=logf, check_balance_first=not args.sync,
+        log=logf, check_balance_first=not (args.sync or args.setup),
     )
     if args.background:
         if args.json:
@@ -468,6 +507,7 @@ def cmd_web(ctx, args):
 # ---------------- 解析器 ----------------
 def build_parser():
     p = argparse.ArgumentParser(prog="autodl", description="AutoDL API 客户端工具")
+    p.add_argument("--version", action="version", version=f"autodl-task-submit {__version__}")
     # 通用参数放在父解析器里，挂到每个子命令，这样 `autodl status --json` 可用（放命令后面）
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--config", help="配置文件路径（默认就近查找 autodl.yaml）")
@@ -507,6 +547,8 @@ def build_parser():
                     help="运行前先把实例仓库更新到 remote 最新（缺仓库则按 git.repo 自动 clone）")
     sp.add_argument("--sync-mode", choices=list(gitsync.SYNC_MODES), default="ff",
                     help="--sync 的脏工作区策略（默认 ff：脏则拒绝）")
+    sp.add_argument("--setup", action="store_true",
+                    help="运行前先按仓库依赖准备环境（hash 幂等，依赖没变则秒跳）")
     sp = add("clone", help="在实例上克隆项目仓库（幂等；已有则 fetch）")
     sp.add_argument("--repo", help="仓库 URL（默认 autodl.yaml 的 git.repo）")
     sp.add_argument("--branch", help="分支（默认 git.branch）")
@@ -517,6 +559,11 @@ def build_parser():
                     help="脏工作区策略：ff=脏则拒绝 / stash=改动收进 stash / reset=丢弃改动(保留未跟踪文件)")
     sp.add_argument("--branch", help="分支（默认 git.branch）")
     sp.add_argument("--dir", help="实例上的目录（默认 <数据盘>/repo）")
+    sp.add_argument("--instance", help="目标实例（默认活动实例）")
+    sp = add("setup", help="按仓库依赖声明准备实例环境（hash 幂等，未变秒跳）")
+    sp.add_argument("--force", action="store_true", help="忽略 hash 强制重装")
+    sp.add_argument("--background", action="store_true", help="后台安装（之后 autodl logs 查进度）")
+    sp.add_argument("--dir", help="仓库目录（默认 <数据盘>/repo）")
     sp.add_argument("--instance", help="目标实例（默认活动实例）")
     sp = add("logs", help="查看后台任务日志 + 退出码 + 指标")
     sp.add_argument("--run-id", help="指定 run_id（默认最近一个）")
@@ -565,7 +612,7 @@ _DISPATCH = {
     "balance": cmd_balance, "stock": cmd_stock, "status": cmd_status, "ls": cmd_status,
     "stop-all": cmd_stop_all, "up": cmd_up, "down": cmd_down, "use": cmd_use, "run": cmd_run,
     "logs": cmd_logs, "runs": cmd_runs, "clone": cmd_clone, "sync": cmd_sync,
-    "push": cmd_push, "pull": cmd_pull,
+    "setup": cmd_setup, "push": cmd_push, "pull": cmd_pull,
     "snapshot-env": cmd_snapshot_env, "idle-guard": cmd_idle_guard,
     "balance-watch": cmd_balance_watch, "batch": cmd_batch, "web": cmd_web,
 }

@@ -9,7 +9,7 @@ AutoDL GPU 云的 **Python 库 + 命令行工具**：开机/复用实例、传�
 ## 安装与配置
 
 ```bash
-pip install autodl-task-submit        # 或本地开发：uv sync
+pip install git+https://github.com/Jus1mple/autodl_task_submit.git   # 或克隆后 uv sync
 echo 'AUTODL_TOKEN=你的Token' > .env  # Token 只放环境变量/.env，不进 yaml（已被 .gitignore）
 cp autodl.example.yaml autodl.yaml    # 可选：改实例规格/区域/预算/SSH/git 仓库
 ```
@@ -107,6 +107,7 @@ info = tasks.refresh_run(ctx, run)         # 探活/tail/完成登记/抓指标
 | `run ...` | 在实例上执行任务（见下；`--sync` 跑前先更新实例仓库）|
 | `clone [--repo URL]` | 在实例上克隆项目仓库（幂等；已有则 fetch）|
 | `sync [--mode M]` | 实例仓库从 remote 更新（本地 push 之后；见 git 工作流）|
+| `setup [--force] [--background]` | 按仓库依赖声明准备环境（hash 幂等，未变秒跳）|
 | `logs [--run-id R]` | 查看后台任务日志 + 退出码 + 指标 |
 | `runs [--limit N]` | 列出台账运行记录（含指标，只查本地）|
 | `push <本地目录> [子目录]` | rsync 同步本地到实例数据盘 |
@@ -139,14 +140,18 @@ git:
 
 ```bash
 autodl clone                             # ① 实例数据盘克隆项目（幂等，断电不丢）
+autodl setup                             # ② 按仓库依赖装环境（探测 setup.sh/environment.yml/
+                                         #    requirements.txt/pyproject；hash 幂等，未变秒跳）
 autodl run --remote-script '~/autodl-tmp/repo/train.sh' --background
-autodl logs --json | jq '{status, exit_code, metrics}'   # ② 回传结果，本地解析
+autodl logs --json | jq '{status, exit_code, metrics}'   # ③ 回传结果，本地解析
 
-# ③ 根据结果本地改代码 → git commit && git push，然后：
-autodl run --sync --remote-script '~/autodl-tmp/repo/train.sh' --background
-#          ^^^^^^ 跑之前自动把实例仓库更新到 origin/main（缺仓库则自动 clone）
+# ④ 根据结果本地改代码/改依赖 → git commit && git push，然后一条命令：
+autodl run --sync --setup --remote-script '~/autodl-tmp/repo/train.sh' --background
+#          ^^^^^^^^^^^^^^ 先更新代码（缺仓库自动 clone），依赖 hash 变了才重装环境，然后跑
 autodl sync --json                       # 也可以单独更新不跑任务
 ```
+
+`setup` 说明：自定义安装命令配 `env.setup`（最高优先）；pip 自动走国内镜像源（`env.pip_index`）且 `--no-cache-dir` 防系统盘爆；`env.academic_turbo: true` 先开学术加速；hash 记在实例系统盘（换实例/换镜像自动失效重装）；安装很久可 `--background` 后 `logs` 查进度；装好后建议 `snapshot-env` 固化成镜像，新实例秒级就绪。
 
 **实例上的数据变了怎么更新**（`--mode` / `--sync-mode` 三种策略）：
 

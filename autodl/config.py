@@ -39,6 +39,15 @@ class GitConfig:
 
 
 @dataclass
+class EnvConfig:
+    """实例上的 Python 环境准备（autodl setup / run --setup 用）。"""
+    setup: str = ""        # 自定义安装命令（最高优先），在仓库目录下执行
+    auto: bool = True      # 未配 setup 时自动探测：setup.sh > environment.yml > requirements.txt > pyproject.toml
+    pip_index: str = "https://pypi.tuna.tsinghua.edu.cn/simple"  # 国内 pip 镜像源；留空用官方
+    academic_turbo: bool = False  # 安装前 source /etc/network_turbo（github/HF 加速，对 pypi 未必快）
+
+
+@dataclass
 class SSHConfig:
     user: str = "root"
     remote_workdir: str = "/root/autodl-tmp"  # 数据盘，放代码/数据/日志
@@ -67,6 +76,7 @@ class Config:
     http: HTTPConfig = field(default_factory=HTTPConfig)
     ssh: SSHConfig = field(default_factory=SSHConfig)
     git: GitConfig = field(default_factory=GitConfig)
+    env: EnvConfig = field(default_factory=EnvConfig)
 
     # 运行时填充（不来自 YAML）
     token: str = field(default="", repr=False)
@@ -137,5 +147,8 @@ def load_config(explicit_path: str | None = None) -> Config:
 
 def require_token(cfg: Config) -> str:
     if not cfg.token:
-        raise ConfigError("未找到 AUTODL_TOKEN，请在 .env 文件中设置 AUTODL_TOKEN=...")
+        raise ConfigError(
+            "未找到 AUTODL_TOKEN。获取：AutoDL 控制台 → 账号 → 设置 → 开发者 Token。"
+            "配置任选其一：项目目录 .env 写 AUTODL_TOKEN=...（推荐）；"
+            "或 export AUTODL_TOKEN=...；或写进 ~/.autodl/.env（全局）")
     return cfg.token

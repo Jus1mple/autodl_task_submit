@@ -30,6 +30,14 @@ git:
   branch: main
   dir: ""         # 实例上的目录；留空 = <ssh.remote_workdir>/repo
 
+# 实例环境准备（autodl setup / run --setup 用）
+env:
+  setup: ""       # 自定义安装命令（最高优先），在仓库目录下执行；留空则自动探测：
+                  #   setup.sh > environment.yml > requirements.txt > pyproject.toml
+  auto: true
+  pip_index: https://pypi.tuna.tsinghua.edu.cn/simple   # 国内镜像源；留空用官方
+  academic_turbo: false   # 安装前 source /etc/network_turbo（github/HF 加速）
+
 http:
   timeout_connect: 10.0
   timeout_read: 30.0
