@@ -26,6 +26,11 @@ from .ssh import _shq
 
 EXEC_MODES = ("remote_script", "remote", "script_text")
 
+# 前台运行时累积到本地内存的 stdout/stderr 各自的上限（字符）。前台把远端输出全读进内存，
+# 训练日志可能几个 GB —— 超过就只留末尾这么多，够看结果/够抓末尾指标，又不 OOM。
+# 巨量输出的正道是 --background（输出落实例日志文件，logs 只 tail 尾部）。
+FG_CAPTURE = 2_000_000
+
 
 # ---------------- 基础件 ----------------
 def build_command(mode, value):
@@ -107,9 +112,11 @@ def run_foreground(ctx, snap, uuid, *, mode, value, run_id, name=None, retries=0
         try:
             if command is None:
                 out, err, code = ctx.ssh.run_script(snap, value, ascii_id(run_id), uuid,
-                                                    prelude=prelude, stream=stream)
+                                                    prelude=prelude, stream=stream,
+                                                    max_capture=FG_CAPTURE)
             else:
-                out, err, code = ctx.ssh.run(snap, prelude + command, uuid, stream=stream)
+                out, err, code = ctx.ssh.run(snap, prelude + command, uuid, stream=stream,
+                                             max_capture=FG_CAPTURE)
         except SSHUnavailable:
             if a + 1 >= attempts:
                 ctx.reg.finish_run(run_id, -1)
@@ -147,28 +154,43 @@ def run_background(ctx, snap, uuid, *, mode, value, run_id, name=None,
 # ---------------- 对账：轮询后台 run ----------------
 def refresh_run(ctx, run, lines=100):
     """轻量 poll 一个 run：探活 + 可选 tail；发现完成则登记退出码并抓指标。
-    返回 {state, exit_code, log, note}；SSH/API 出错只写 note，绝不抛（守护线程可直接用）。"""
+    返回 {state, exit_code, log, note}；SSH/API 出错只写 note，绝不抛（守护线程可直接用）。
+
+    指标幂等补抽：抓指标只在任务完成那一刻做一次，若那时 SSH 抖动/实例已关就会漏。
+    这里对「已完成但台账里还没有指标」的 run，只要实例还能连就再抽一次——metrics.json
+    在数据盘上一直都在，补抽把「一次性」变成「可重试」。实例已关时给出明确指引而非静默空。"""
     out = {"state": run.get("status"), "exit_code": run.get("exit_code"), "log": "", "note": ""}
     uuid = run.get("instance_uuid")
     if not uuid:
         out["note"] = "run 无实例信息"
         return out
+    done_states = ("succeeded", "failed")
+    missing_metrics = run.get("status") in done_states and not ctx.reg.get_metrics(run["run_id"])
     try:
         st = ctx.api.status_or_none(uuid)
         if st != "running":
-            out["note"] = f"实例非 running（{st}），仅显示已存状态"
+            note = f"实例非 running（{st}），仅显示已存状态"
+            if missing_metrics:
+                note += "；指标未入库，开机后 autodl logs --run-id 可补抓（metrics.json 仍在数据盘）"
+            out["note"] = note
             return out
         snap = ctx.api.snapshot(uuid)
+        cfg_d = json.loads(run.get("config_json") or "{}")
         if run.get("status") == "running" and run.get("exit_file"):
             state, code = ctx.ssh.poll(snap, {"pid": run.get("pid"), "exit_file": run["exit_file"]}, uuid)
             if state == "done":
                 ctx.reg.finish_run(run["run_id"], code if code is not None else -1)
-                cfg_d = json.loads(run.get("config_json") or "{}")
                 extract_metrics(ctx, snap, uuid, run["run_id"], cfg_d.get("metrics_spec"),
                                 cfg_d.get("metrics_file"), log_path=run.get("log_path"))
                 out["state"], out["exit_code"] = "done", code
             else:
                 out["state"] = "running"
+        elif missing_metrics:
+            # 已完成但漏抓：实例还活着，补抽一次（幂等，record_metrics 同 key 覆盖）
+            extract_metrics(ctx, snap, uuid, run["run_id"], cfg_d.get("metrics_spec"),
+                            cfg_d.get("metrics_file"), log_path=run.get("log_path"))
+            if ctx.reg.get_metrics(run["run_id"]):
+                out["note"] = "已补抓到指标"
         if lines and run.get("log_path") and run["log_path"] != "(sync)":
             out["log"] = ctx.ssh.tail(snap, run["log_path"], lines=lines, instance_uuid=uuid)
     except SSHUnavailable as e:
