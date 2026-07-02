@@ -1,6 +1,7 @@
 # autodl 配置示例：复制为 autodl.yaml 后按需修改。
 # 注意：Token 不放这里，放环境变量 / .env 的 AUTODL_TOKEN=...（避免误提交泄漏）。
-# .env 查找顺序：已导出的环境变量 > 当前目录及父目录 .env > 本文件旁的 .env > ~/.autodl/.env
+# .env 优先级：当前目录及父目录 .env（项目本地，覆盖全局环境变量）> 本文件旁的 .env
+#             > 已导出的环境变量 > ~/.autodl/.env（全局兜底）
 
 base_url: https://api.autodl.com
 
