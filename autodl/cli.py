@@ -184,9 +184,32 @@ def _resolve_ready(ctx, instance, log=print):
     return uuid, ctx.ensure_specific(uuid, log=log)
 
 
+def _print_patches(p, file=None):
+    """展示 patch 应用结果。"""
+    file = file or sys.stdout
+    if not p or not p.get("total"):
+        return
+    parts = []
+    if p["applied"]:
+        parts.append(f"应用 {len(p['applied'])}")
+    if p["skipped"]:
+        parts.append(f"已在 {len(p['skipped'])}")
+    if p["failed"]:
+        parts.append(f"冲突 {len(p['failed'])}")
+    print(f"  本地 patch（只改工作区，不 commit/push）：{', '.join(parts)}", file=file)
+    for n in p["failed"]:
+        print(f"    ⚠️ 冲突: {n}（上游可能已改同处，需更新此 patch）", file=file)
+
+
 def cmd_clone(ctx, args):
     uuid, snap = _resolve_ready(ctx, args.instance, log=_eprint if args.json else print)
     res = gitsync.clone(ctx, snap, uuid, repo=args.repo, branch=args.branch, dir=args.dir)
+    logf = _eprint if args.json else print
+    patches = gitsync.apply_patches(ctx, snap, uuid, dir=res["dir"],
+                                    log=None if args.json else logf) \
+        if gitsync.local_patches(ctx.cfg) else None
+    if patches:
+        res["patches"] = patches
     if args.json:
         print(json.dumps(res, ensure_ascii=False))
         return EXIT_OK
@@ -194,6 +217,7 @@ def cmd_clone(ctx, args):
     print(f"  HEAD: {res['head']}")
     if res["credentials"]:
         print("  已写入私有仓库凭据（来自本地 AUTODL_GIT_TOKEN）")
+    _print_patches(patches)
     return EXIT_OK
 
 
@@ -217,12 +241,35 @@ def _print_sync(r, file=None):
 
 def cmd_sync(ctx, args):
     uuid, snap = _resolve_ready(ctx, args.instance, log=_eprint if args.json else print)
-    res = gitsync.sync(ctx, snap, uuid, mode=args.mode, dir=args.dir, branch=args.branch)
+    logf = _eprint if args.json else print
+    has_patches = bool(gitsync.local_patches(ctx.cfg))
+    # 配了 patch 时用 reset：旧 patch 是 tracked 改动，reset 丢弃它们、保留产物，再重放 patch
+    mode = "reset" if (has_patches and args.mode == "ff") else args.mode
+    res = gitsync.sync(ctx, snap, uuid, mode=mode, dir=args.dir, branch=args.branch)
+    if has_patches and not res["blocked"] and not res["error"]:
+        res["patches"] = gitsync.apply_patches(ctx, snap, uuid, dir=res["dir"],
+                                               log=None if args.json else logf)
     if args.json:
         print(json.dumps(res, ensure_ascii=False))
     else:
         _print_sync(res)
+        _print_patches(res.get("patches"))
     return EXIT_OK if not (res["blocked"] or res["error"]) else EXIT_ERR
+
+
+def cmd_patch(ctx, args):
+    """单独把本地 patch 目录应用到实例（clone/sync 已自动带；此命令用于手动重放/调试）。"""
+    if not gitsync.local_patches(ctx.cfg):
+        print("未配置本地 patch：在 autodl.yaml 设 git.patches: <目录>（放 *.patch）", file=sys.stderr)
+        return EXIT_USAGE
+    uuid, snap = _resolve_ready(ctx, args.instance, log=_eprint if args.json else print)
+    res = gitsync.apply_patches(ctx, snap, uuid, dir=args.dir,
+                                log=None if args.json else print)
+    if args.json:
+        print(json.dumps(res, ensure_ascii=False))
+    else:
+        _print_patches(res)
+    return EXIT_OK if not res["failed"] else EXIT_ERR
 
 
 def cmd_setup(ctx, args):
@@ -277,12 +324,17 @@ def cmd_run(ctx, args):
         else:
             uuid0, snap0 = ctx.ensure_instance(select_region=args.select_region, log=logf)
         if args.sync:
-            res_sync = gitsync.update(ctx, snap0, uuid0, mode=args.sync_mode)
+            res_sync = gitsync.update(ctx, snap0, uuid0, mode=args.sync_mode, log=logf)
             if res_sync["blocked"] or res_sync["error"]:
                 _print_sync(res_sync, file=sys.stderr)
                 print("sync 未完成，已中止运行（实例保持原样）。", file=sys.stderr)
                 return EXIT_ERR
             logf(f"sync: {res_sync['old'] or '-'} -> {res_sync['new']}  {res_sync['message']}")
+            p = res_sync.get("patches")
+            if p and p.get("failed"):
+                print(f"patch 有 {len(p['failed'])} 个冲突，已中止运行（避免用未适配的代码跑）：{p['failed']}",
+                      file=sys.stderr)
+                return EXIT_ERR
         if args.setup:
             res_setup = envsetup.run_setup(ctx, snap0, uuid0,
                                            stream=None if args.json else _print_chunk, log=logf)
@@ -561,6 +613,9 @@ def build_parser():
     sp.add_argument("--branch", help="分支（默认 git.branch）")
     sp.add_argument("--dir", help="实例上的目录（默认 <数据盘>/repo）")
     sp.add_argument("--instance", help="目标实例（默认活动实例）")
+    sp = add("patch", help="把本地 patch 目录(git.patches)应用到实例(clone/sync 已自动带)")
+    sp.add_argument("--dir", help="仓库目录（默认 <数据盘>/repo）")
+    sp.add_argument("--instance", help="目标实例（默认活动实例）")
     sp = add("setup", help="按仓库依赖声明准备实例环境（hash 幂等，未变秒跳）")
     sp.add_argument("--force", action="store_true", help="忽略 hash 强制重装")
     sp.add_argument("--background", action="store_true", help="后台安装（之后 autodl logs 查进度）")
@@ -613,7 +668,7 @@ _DISPATCH = {
     "balance": cmd_balance, "stock": cmd_stock, "status": cmd_status, "ls": cmd_status,
     "stop-all": cmd_stop_all, "up": cmd_up, "down": cmd_down, "use": cmd_use, "run": cmd_run,
     "logs": cmd_logs, "runs": cmd_runs, "clone": cmd_clone, "sync": cmd_sync,
-    "setup": cmd_setup, "push": cmd_push, "pull": cmd_pull,
+    "patch": cmd_patch, "setup": cmd_setup, "push": cmd_push, "pull": cmd_pull,
     "snapshot-env": cmd_snapshot_env, "idle-guard": cmd_idle_guard,
     "balance-watch": cmd_balance_watch, "batch": cmd_batch, "web": cmd_web,
 }

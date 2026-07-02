@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import os
 import posixpath
+from pathlib import Path
 from urllib.parse import quote
 
 from .errors import AutoDLError
@@ -27,6 +28,67 @@ SYNC_MODES = ("ff", "stash", "reset")
 
 def repo_dir(cfg):
     return cfg.git.dir or posixpath.join(cfg.ssh.remote_workdir, "repo")
+
+
+def local_patches(cfg):
+    """本地 patch 文件列表（排序，*.patch）。cfg.git.patches 是相对 autodl.yaml 的目录或单文件。
+    用 NN-name.patch 前缀可控制应用顺序。"""
+    pd = (cfg.git.patches or "").strip()
+    if not pd:
+        return []
+    p = Path(pd)
+    if not p.is_absolute():
+        p = Path(getattr(cfg, "_base_dir", Path.cwd())) / p
+    if p.is_dir():
+        return sorted(str(f) for f in p.glob("*.patch"))
+    return [str(p)] if p.exists() else []
+
+
+def apply_patches(ctx, snap, uuid, dir=None, log=None):
+    """把本地 patch 目录的 *.patch 上传到实例并 git apply（幂等）。
+    - 已应用（git apply --reverse --check 通过）→ 跳过
+    - 能干净应用 → git apply
+    - 冲突（多半是上游改了同一处）→ 记 failed，不中断其余
+    返回 {applied, skipped, failed, total, dir}。**只改工作区，绝不 commit/push**——
+    改的是别人的仓库时，你的适配补丁不会进实例 git 历史，也就不可能被推回上游。"""
+    cfg = ctx.cfg
+    d = dir or repo_dir(cfg)
+    patches = local_patches(cfg)
+    res = {"applied": [], "skipped": [], "failed": [], "total": len(patches), "dir": d}
+    if not patches:
+        return res
+    remote_dir = posixpath.join(cfg.ssh.remote_workdir, ".autodl_patches")
+    for pf in patches:
+        name = os.path.basename(pf)
+        try:
+            content = Path(pf).read_text(encoding="utf-8")
+        except OSError as e:
+            res["failed"].append(name)
+            if log:
+                log(f"  ⚠️ patch 读取失败 {name}: {e}")
+            continue
+        remote_pf = posixpath.join(remote_dir, name)
+        ctx.ssh.write_file(snap, remote_pf, content, uuid)
+        script = (
+            f'cd {_shq(d)} 2>/dev/null || {{ echo "@@NOREPO"; exit 0; }}\n'
+            f'if git apply --reverse --check {_shq(remote_pf)} 2>/dev/null; then echo "@@SKIP"; \n'
+            f'elif git apply --check {_shq(remote_pf)} 2>/dev/null; then '
+            f'git apply {_shq(remote_pf)} && echo "@@APPLIED"; else echo "@@FAIL"; fi'
+        )
+        out, _e, _c = ctx.ssh.run(snap, script, uuid)
+        if "@@APPLIED" in out:
+            res["applied"].append(name)
+            if log:
+                log(f"  patch 应用: {name}")
+        elif "@@SKIP" in out:
+            res["skipped"].append(name)
+            if log:
+                log(f"  patch 已在: {name}（跳过）")
+        else:
+            res["failed"].append(name)
+            if log:
+                log(f"  ⚠️ patch 冲突: {name}（上游可能已改动同处，需更新 patch）")
+    return res
 
 
 def _net_prelude(cfg):
@@ -186,14 +248,22 @@ def sync(ctx, snap, uuid, mode="ff", dir=None, branch=None):
     }
 
 
-def update(ctx, snap, uuid, mode="ff", repo=None, branch=None, dir=None):
-    """clone-if-missing + sync：run --sync 用的一步到位入口。返回 sync() 的结构。"""
+def update(ctx, snap, uuid, mode="ff", repo=None, branch=None, dir=None, log=None):
+    """clone-if-missing + sync + 应用本地 patch：run --sync 用的一步到位入口。
+    配了 git.patches 时，为了让 patch 每次叠在干净上游之上：更新走 reset（丢弃上一轮
+    的 patch 改动、保留未跟踪产物），再重放 patch。返回 sync() 的结构 + "patches" 字段。"""
     cfg = ctx.cfg
     d = dir or repo_dir(cfg)
+    has_patches = bool(local_patches(cfg))
     out, _e, _c = ctx.ssh.run(snap, f'[ -d {_shq(d)}/.git ] && echo YES || echo NO', uuid)
     if out.strip().startswith("NO"):
         info = clone(ctx, snap, uuid, repo=repo, branch=branch, dir=d)
-        return {"dir": d, "branch": info["branch"], "mode": mode, "old": None,
-                "new": info["head"].split()[0] if info["head"] else None, "updated": True,
-                "dirty": [], "blocked": False, "error": "", "message": "(fresh clone)"}
-    return sync(ctx, snap, uuid, mode=mode, dir=d, branch=branch)
+        result = {"dir": d, "branch": info["branch"], "mode": mode, "old": None,
+                  "new": info["head"].split()[0] if info["head"] else None, "updated": True,
+                  "dirty": [], "blocked": False, "error": "", "message": "(fresh clone)"}
+    else:
+        # 有 patch 时用 reset：旧 patch 是 tracked 改动，reset 丢弃它们、保留产物，再重放
+        result = sync(ctx, snap, uuid, mode="reset" if has_patches else mode, dir=d, branch=branch)
+    if has_patches and not result.get("error") and not result.get("blocked"):
+        result["patches"] = apply_patches(ctx, snap, uuid, dir=d, log=log)
+    return result
