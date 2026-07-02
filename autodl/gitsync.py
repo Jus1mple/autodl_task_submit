@@ -29,6 +29,26 @@ def repo_dir(cfg):
     return cfg.git.dir or posixpath.join(cfg.ssh.remote_workdir, "repo")
 
 
+def _net_prelude(cfg):
+    """clone/fetch 前置：国内实例拉 GitHub 大仓库常因传输中断失败，这里
+    可选走 AutoDL 学术加速 + 放大缓冲/放宽慢速超时，显著降低 GnuTLS/EOF 中断。"""
+    lines = []
+    if cfg.git.turbo:
+        lines.append("source /etc/network_turbo 2>/dev/null || true")
+    lines += [
+        "git config --global http.postBuffer 524288000 2>/dev/null || true",
+        "git config --global http.lowSpeedLimit 1000 2>/dev/null || true",
+        "git config --global http.lowSpeedTime 60 2>/dev/null || true",
+    ]
+    return "".join(l + "\n" for l in lines)
+
+
+def _clone_depth_flag(cfg):
+    """仅用于初次 clone：浅克隆规避国内拉大仓库中断。后续 fetch 不限深——
+    浅仓库的增量 fetch 本就很小，且保留历史连接让 ff merge 仍可用。"""
+    return f" --depth {int(cfg.git.depth)}" if cfg.git.depth and int(cfg.git.depth) > 0 else ""
+
+
 def _ensure_git(ctx, snap, uuid):
     out, _e, _c = ctx.ssh.run(snap, "command -v git || true", uuid)
     if out.strip():
@@ -87,11 +107,12 @@ def clone(ctx, snap, uuid, repo=None, branch=None, dir=None):
     parent = posixpath.dirname(d.rstrip("/")) or "/"
     script = (
         f'export GIT_TERMINAL_PROMPT=0\n'
+        f'{_net_prelude(cfg)}'
         f'if [ -d {_shq(d)}/.git ]; then\n'
         f'  cd {_shq(d)} && git fetch origin {_shq(branch)} 2>&1 && echo "@@EXISTS"\n'
         f'else\n'
         f'  mkdir -p {_shq(parent)} 2>/dev/null\n'
-        f'  git clone --branch {_shq(branch)} {_shq(repo)} {_shq(d)} 2>&1 && echo "@@CLONED"\n'
+        f'  git clone{_clone_depth_flag(cfg)} --branch {_shq(branch)} {_shq(repo)} {_shq(d)} 2>&1 && echo "@@CLONED"\n'
         f'fi\n'
         f'cd {_shq(d)} && echo "@@HEAD $(git rev-parse --short HEAD) $(git log -1 --format=%s)"'
     )
@@ -135,6 +156,7 @@ def sync(ctx, snap, uuid, mode="ff", dir=None, branch=None):
         )
     script = (
         f'export GIT_TERMINAL_PROMPT=0\n'
+        f'{_net_prelude(cfg)}'
         f'cd {_shq(d)} 2>/dev/null || {{ echo "@@NO_REPO"; exit 0; }}\n'
         f'[ -d .git ] || {{ echo "@@NO_REPO"; exit 0; }}\n'
         f'FOUT=$(git fetch origin {_shq(branch)} 2>&1) || '

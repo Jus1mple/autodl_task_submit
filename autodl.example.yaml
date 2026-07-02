@@ -29,6 +29,8 @@ git:
   repo: ""        # 如 https://github.com/you/proj.git；私有 https 库本地 export AUTODL_GIT_TOKEN=...
   branch: main
   dir: ""         # 实例上的目录；留空 = <ssh.remote_workdir>/repo
+  depth: 1        # 浅克隆深度（部署副本无需全历史，规避国内拉大仓库中断）；0=全克隆
+  turbo: true     # clone/fetch 前 source /etc/network_turbo（AutoDL 学术加速，对 github 有效）
 
 # 实例环境准备（autodl setup / run --setup 用）
 env:

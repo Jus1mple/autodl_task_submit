@@ -174,16 +174,17 @@ def cmd_use(ctx, args):
     return EXIT_OK
 
 
-def _resolve_ready(ctx, instance):
-    """目标实例（--instance 或活动实例），确保 running（关机则开机）。返回 (uuid, snap)。"""
+def _resolve_ready(ctx, instance, log=print):
+    """目标实例（--instance 或活动实例），确保 running（关机则开机）。返回 (uuid, snap)。
+    log 默认 print；--json 模式须传 _eprint，避免开机进度污染 stdout 的纯 JSON。"""
     uuid = instance or ctx.reg.get_active()
     if not uuid:
         raise AutoDLError("没有目标实例：加 --instance，或先 autodl use / up")
-    return uuid, ctx.ensure_specific(uuid)
+    return uuid, ctx.ensure_specific(uuid, log=log)
 
 
 def cmd_clone(ctx, args):
-    uuid, snap = _resolve_ready(ctx, args.instance)
+    uuid, snap = _resolve_ready(ctx, args.instance, log=_eprint if args.json else print)
     res = gitsync.clone(ctx, snap, uuid, repo=args.repo, branch=args.branch, dir=args.dir)
     if args.json:
         print(json.dumps(res, ensure_ascii=False))
@@ -214,7 +215,7 @@ def _print_sync(r, file=None):
 
 
 def cmd_sync(ctx, args):
-    uuid, snap = _resolve_ready(ctx, args.instance)
+    uuid, snap = _resolve_ready(ctx, args.instance, log=_eprint if args.json else print)
     res = gitsync.sync(ctx, snap, uuid, mode=args.mode, dir=args.dir, branch=args.branch)
     if args.json:
         print(json.dumps(res, ensure_ascii=False))
@@ -224,7 +225,7 @@ def cmd_sync(ctx, args):
 
 
 def cmd_setup(ctx, args):
-    uuid, snap = _resolve_ready(ctx, args.instance)
+    uuid, snap = _resolve_ready(ctx, args.instance, log=_eprint if args.json else print)
     res = envsetup.run_setup(ctx, snap, uuid, dir=args.dir, force=args.force,
                              background=args.background,
                              stream=None if args.json else _print_chunk,
