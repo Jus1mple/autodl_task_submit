@@ -36,6 +36,8 @@ class GitConfig:
     repo: str = ""       # 远端仓库 URL（https/ssh）；私有 https 库配合环境变量 AUTODL_GIT_TOKEN
     branch: str = "main"
     dir: str = ""        # 实例上的项目目录；留空 = <ssh.remote_workdir>/repo
+    depth: int = 1       # 浅克隆深度（部署副本无需全历史，规避国内拉大仓库中断）；0=全克隆
+    turbo: bool = True   # clone/fetch 前 source /etc/network_turbo（AutoDL 学术加速，对 github 有效）
 
 
 @dataclass

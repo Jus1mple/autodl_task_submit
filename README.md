@@ -165,6 +165,8 @@ autodl sync --json                       # 也可以单独更新不跑任务
 
 私有仓库（https）：本地设 `AUTODL_GIT_TOKEN`，`clone` 时会把凭据写进实例的 `~/.git-credentials`（0600），token 不进命令行和日志。
 
+国内实例拉 GitHub 大仓库易因传输中断（GnuTLS/EOF）失败，`clone` 默认**浅克隆**（`git.depth: 1`，部署副本无需全历史）+ 走 **AutoDL 学术加速**（`git.turbo: true`，`source /etc/network_turbo`）+ 放宽慢速超时。需要全历史（如 `git describe`）改 `git.depth: 0`。后续 `sync` 的增量 fetch 不受深度限制，`ff` 快进照常可用。
+
 ## 批量并行（超参搜索等）
 
 任务清单 `jobs.yaml`（每个任务三选一：`remote_script` / `remote` / `script`）：
