@@ -1,7 +1,7 @@
 """批量并行调度器：把 N 个任务铺到至多 max_parallel 台实例上跑。
 
 - 每个 worker 独占一台实例，从共享队列里取任务跑，一个跑完取下一个（实例复用）。
-- 任务执行/记台账/抓指标走 tasks.run_foreground（与 CLI run、web 同一条管线），
+- 任务执行/记台账/抓指标走 tasks.run_foreground（与 CLI run 同一条管线），
   run_id = "<batch_id>:<job_id>"，支持 resume（已成功的跳过）。
 - 收尾统一走 Context.finish_instance：release（释放）/ power_off（关机保留）/ keep（不动）。
 - 并发安全：队列用 queue.Queue；registry 每次操作独立 sqlite 连接（WAL+busy_timeout）。

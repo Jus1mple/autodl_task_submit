@@ -18,7 +18,7 @@ _TRANSIENT_BOOTING = {"starting", "sys_volume_creating"}
 
 
 def billing_class(status):
-    """实例状态 → 计费口径（CLI 与 web 共用的展示逻辑）。"""
+    """实例状态 → 计费口径（CLI 与 web-dashboard 分支共用的展示逻辑）。"""
     if status == "running":
         return "带卡计费"
     if status in ("shutdown", "power_off", "shutting_down"):

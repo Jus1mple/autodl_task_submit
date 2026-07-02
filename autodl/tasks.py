@@ -5,10 +5,10 @@
 
 - build_command()：remote_script/remote → 远端命令（正确处理 ~ / $HOME）
 - run_foreground()/run_background()：执行 + 记 registry + 抓指标，前后台同一套约定
-- refresh_run()：轮询后台 run（探活/tail/完成登记/抓指标），logs 命令、web 详情页、
-  对账线程共用
+- refresh_run()：轮询后台 run（探活/tail/完成登记/抓指标），logs 命令与
+  web 大盘（web-dashboard 分支）的对账线程共用
 - submit()：一站式编排（余额护栏 → 起/复用实例 → 执行 → 按需收尾），CLI run 命令、
-  生成的提交脚本、旧 submit.py 都只是它的薄壳
+  旧 submit.py、web 分支生成的提交脚本都只是它的薄壳
 
 约定：每次运行前先清掉实例上的旧 metrics.json，避免上一轮的指标被算到本轮头上。
 """
@@ -129,7 +129,7 @@ def run_background(ctx, snap, uuid, *, mode, value, run_id, name=None,
                    config_yaml=None, metrics_spec=None, config_extra=None,
                    experiment_id=None, tag=None):
     """后台脱机执行，立即返回 {run_id, pid, log, exit_file, workdir, instance}。
-    之后用 refresh_run()（logs 命令 / web 对账线程）判定完成并抓指标。"""
+    之后用 refresh_run()（logs 命令等）判定完成并抓指标。"""
     command, _metrics_file, prelude = _prepare(ctx, snap, uuid, mode, value, config_yaml)
     remote_id = ascii_id(run_id)
     if command is None:

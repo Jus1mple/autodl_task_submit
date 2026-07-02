@@ -8,11 +8,13 @@
   up [--select-region] 拉起/复用实例，注入公钥免密，写 ssh config，打印直连信息
   down [--release]     关机当前活动实例（--release 则释放）
   run --script F [--background]  上传脚本并执行（默认前台，--background 后台脱机）
-  logs [--run-id R]    查看后台任务日志（tail）
+  logs [--run-id R]    查看后台任务日志 + 退出码 + 指标
+  runs [--limit N]     列出台账里的运行记录（含指标）
   push LOCAL [SUB]     rsync 同步本地目录到实例数据盘
   pull SUB [LOCAL]     rsync 从实例拉回产物
 
 全局：--config 指定配置文件；--dry-run 仅预览破坏性动作；--yes 跳过确认；--json 机器可读。
+--json 时 stdout 只输出 JSON（进度日志走 stderr），可以直接 `| jq` / 被脚本消费。
 退出码：0 成功；2 用法错误；3 余额不足；4 无库存；5 SSH 不可达；6 任务非零退出；1 其它。
 """
 from __future__ import annotations
@@ -47,6 +49,11 @@ def _print_chunk(chunk):
     sys.stdout.flush()
 
 
+def _eprint(msg):
+    """进度日志走 stderr：--json 模式下 stdout 只留给 JSON 数据。"""
+    print(msg, file=sys.stderr)
+
+
 # ---------------- 命令实现 ----------------
 def cmd_balance(ctx, args):
     bal = ctx.api.balance_yuan()
@@ -64,7 +71,7 @@ def cmd_stock(ctx, args):
         try:
             data = ctx.api.gpu_stock(region, cuda_v_from=ctx.cfg.cuda_v_from) or []
         except APIError as e:
-            print(f"[{region}] 查询失败: {e}")
+            print(f"[{region}] 查询失败: {e}", file=sys.stderr)
             continue
         items = {name: st for entry in data for name, st in entry.items()}
         out[region] = items
@@ -187,16 +194,22 @@ def cmd_run(ctx, args):
         select_region=args.select_region, background=args.background,
         teardown=teardown, run_id=args.name,
         stream=None if (args.json or args.background) else _print_chunk,
+        log=_eprint if args.json else print,
     )
     if args.background:
-        print(f"后台任务已启动: run_id={res['run_id']} pid={res['pid']}")
-        print(f"  日志: {res['log']}")
-        print(f"  查看进度: autodl logs --run-id {res['run_id']}")
+        if args.json:
+            print(json.dumps({k: res[k] for k in ("run_id", "pid", "log", "exit_file", "instance")},
+                             ensure_ascii=False))
+        else:
+            print(f"后台任务已启动: run_id={res['run_id']} pid={res['pid']}")
+            print(f"  日志: {res['log']}")
+            print(f"  查看进度: autodl logs --run-id {res['run_id']}")
         # 后台模式下不在这里关机（任务还在跑）；完成后由用户决定 down
         return EXIT_OK
     if args.json:
-        print(json.dumps({k: res[k] for k in ("run_id", "exit_code", "stdout", "stderr", "instance")},
-                         ensure_ascii=False))
+        payload = {k: res[k] for k in ("run_id", "exit_code", "stdout", "stderr", "instance")}
+        payload["metrics"] = ctx.reg.get_metrics(res["run_id"])
+        print(json.dumps(payload, ensure_ascii=False))
     elif res["exit_code"] != 0:
         print(f"[远程退出码] {res['exit_code']}")
     return EXIT_OK if res["exit_code"] == 0 else EXIT_TASK
@@ -206,28 +219,61 @@ def cmd_logs(ctx, args):
     if args.run_id:
         run = ctx.reg.get_run(args.run_id)
         if not run:
-            print(f"未找到 run: {args.run_id}")
+            print(f"未找到 run: {args.run_id}", file=sys.stderr)
             return EXIT_USAGE
     else:
         runs = ctx.reg.list_runs()
         if not runs:
-            print("没有记录的后台任务。")
+            print("没有记录的后台任务。", file=sys.stderr if args.json else sys.stdout)
             return EXIT_OK
         run = runs[-1]
-        print(f"(最近任务 run_id={run['run_id']})")
+        if not args.json:
+            print(f"(最近任务 run_id={run['run_id']})")
     info = tasks.refresh_run(ctx, run, lines=args.lines)
+    cur = ctx.reg.get_run(run["run_id"]) or run
+    m = ctx.reg.get_metrics(run["run_id"])
+    if args.json:
+        print(json.dumps({"run_id": run["run_id"], "status": cur["status"],
+                          "exit_code": cur.get("exit_code"), "instance": cur.get("instance_uuid"),
+                          "log": info["log"], "note": info["note"], "metrics": m},
+                         ensure_ascii=False))
+        return EXIT_OK
     if info["log"]:
         print(info["log"])
     if info["note"]:
         print(f"({info['note']})")
-    cur = ctx.reg.get_run(run["run_id"]) or run
     line = f"--- 状态: {cur['status']}"
     if cur.get("exit_code") is not None:
         line += f" 退出码={cur['exit_code']}"
     print(line + " ---")
-    m = ctx.reg.get_metrics(run["run_id"])
     if m:
         print("指标: " + json.dumps(m, ensure_ascii=False))
+    return EXIT_OK
+
+
+def cmd_runs(ctx, args):
+    """列出台账里的运行记录（最近的在前，含指标）——只查本地 SQLite，不触网。"""
+    allm = ctx.reg.all_metrics()
+    rows = []
+    for r in ctx.reg.list_runs():
+        rows.append({"run_id": r["run_id"], "status": r["status"], "exit_code": r["exit_code"],
+                     "instance": r["instance_uuid"], "experiment_id": r.get("experiment_id"),
+                     "tag": r.get("tag"), "started_at": r["started_at"],
+                     "metrics": allm.get(r["run_id"], {})})
+    rows.sort(key=lambda x: x["started_at"] or 0, reverse=True)
+    if args.limit:
+        rows = rows[: args.limit]
+    if args.json:
+        print(json.dumps({"runs": rows}, ensure_ascii=False))
+        return EXIT_OK
+    if not rows:
+        print("台账里没有运行记录。")
+        return EXIT_OK
+    for r in rows:
+        code = "-" if r["exit_code"] is None else str(r["exit_code"])
+        tag = f"[{r['tag']}] " if r["tag"] else ""
+        m = " ".join(f"{k}={v}" for k, v in r["metrics"].items())
+        print(f"{r['run_id']:<40} {r['status']:<10} exit={code:<4} {tag}{m}".rstrip())
     return EXIT_OK
 
 
@@ -338,19 +384,6 @@ def cmd_batch(ctx, args):
     return EXIT_TASK if bad else EXIT_OK
 
 
-def cmd_web(ctx, args):
-    try:
-        from .web.server import serve
-    except ImportError as e:
-        print("缺少 web 依赖。安装：pip install 'autodl-task-submit[web]'  或  uv add fastapi uvicorn",
-              file=sys.stderr)
-        print(f"（{e}）", file=sys.stderr)
-        return EXIT_USAGE
-    print(f"启动实验大盘: http://{args.host}:{args.port}  （Ctrl-C 退出）")
-    serve(host=args.host, port=args.port, cfg=ctx.cfg)
-    return EXIT_OK
-
-
 # ---------------- 解析器 ----------------
 def build_parser():
     p = argparse.ArgumentParser(prog="autodl", description="AutoDL API 客户端工具")
@@ -389,9 +422,11 @@ def build_parser():
     sp.add_argument("--select-region", action="store_true", help="按库存自动选区创建")
     sp.add_argument("--down", action="store_true", help="前台任务结束后关机（保留以便复用）")
     sp.add_argument("--release", action="store_true", help="前台任务结束后释放（彻底停止计费）")
-    sp = add("logs", help="查看后台任务日志")
+    sp = add("logs", help="查看后台任务日志 + 退出码 + 指标")
     sp.add_argument("--run-id", help="指定 run_id（默认最近一个）")
     sp.add_argument("--lines", type=int, default=50, help="tail 行数")
+    sp = add("runs", help="列出台账里的运行记录（含指标，只查本地不触网）")
+    sp.add_argument("--limit", type=int, default=20, help="最多显示条数（0=全部）")
     sp = add("snapshot-env", help="把实例环境存为私有镜像（会持续占存储费）")
     sp.add_argument("--name", required=True, help="镜像名")
     sp.add_argument("--instance", help="目标实例（默认活动实例）")
@@ -410,9 +445,6 @@ def build_parser():
     sp.add_argument("--interval", type=int, default=300, help="轮询间隔(秒)")
     sp.add_argument("--stop-mode", choices=["stop_all", "active"], default="stop_all", help="急停范围")
     sp.add_argument("--once", action="store_true", help="只查一次")
-    sp = add("web", help="启动可视化实验大盘（需 [web] 依赖）")
-    sp.add_argument("--host", default="127.0.0.1", help="监听地址")
-    sp.add_argument("--port", type=int, default=8848, help="端口")
     sp = add("batch", help="批量并行调度（多实例跑多任务）")
     sp.add_argument("--file", required=True, help="任务清单 YAML（list of {id, remote_script|remote|script}）")
     sp.add_argument("--max-parallel", type=int, default=2, help="并发实例数上限")
@@ -433,9 +465,9 @@ def build_parser():
 _DISPATCH = {
     "balance": cmd_balance, "stock": cmd_stock, "status": cmd_status, "ls": cmd_status,
     "stop-all": cmd_stop_all, "up": cmd_up, "down": cmd_down, "use": cmd_use, "run": cmd_run,
-    "logs": cmd_logs, "push": cmd_push, "pull": cmd_pull,
+    "logs": cmd_logs, "runs": cmd_runs, "push": cmd_push, "pull": cmd_pull,
     "snapshot-env": cmd_snapshot_env, "idle-guard": cmd_idle_guard,
-    "balance-watch": cmd_balance_watch, "batch": cmd_batch, "web": cmd_web,
+    "balance-watch": cmd_balance_watch, "batch": cmd_batch,
 }
 
 
