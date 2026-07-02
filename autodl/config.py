@@ -1,11 +1,12 @@
 """配置：从 YAML 文件 + 环境变量(.env) 加载，去掉源码里的硬编码常量。
 
-Token 永远只从环境变量读，绝不写进 YAML（避免泄漏/误提交）。加载优先级：
-  1. 已导出的环境变量（AUTODL_TOKEN=... autodl run ...）
-  2. 当前目录及其父目录里的 .env（项目本地）
-  3. autodl.yaml 所在目录的 .env（--config 指到别处时跟着配置走）
-  4. ~/.autodl/.env（全局兜底，任意目录都能用）
-.env 只补缺不覆盖：先加载到的值优先，真环境变量永远最大。
+Token 永远只从环境变量/.env 读，绝不写进 YAML（避免泄漏/误提交）。加载优先级
+（高 → 低），核心原则：**项目本地 .env 覆盖一切，包括已导出的全局环境变量**——
+在哪个项目目录里跑，就用哪个项目的 token：
+  1. 当前目录及其父目录里的 .env（项目本地，最高）
+  2. autodl.yaml 所在目录的 .env（--config 指到别处时跟着配置走）
+  3. 已导出的环境变量（export AUTODL_TOKEN=...）
+  4. ~/.autodl/.env（全局兜底，只补缺，任意目录都能用）
 """
 from __future__ import annotations
 
@@ -109,15 +110,16 @@ def find_config_file(explicit: str | None = None) -> Path | None:
 
 
 def _load_env_files(config_path: Path | None):
-    """按优先级加载 .env（load_dotenv 只补缺不覆盖，已存在的环境变量永远优先）。
+    """按优先级加载 .env：项目本地覆盖全局环境变量（override=True），
+    ~/.autodl/.env 只补缺。后加载且 override 的赢，所以按低→高的顺序加载。
     注意必须 usecwd=True：默认的 find_dotenv 从本模块（site-packages）位置向上找，
     pip 安装后会找不到项目里的 .env。"""
-    found = find_dotenv(usecwd=True)  # cwd 及其父目录
-    if found:
-        load_dotenv(found)
+    load_dotenv(Path.home() / ".autodl" / ".env")  # 全局兜底：只补缺，不盖环境变量
     if config_path is not None:
-        load_dotenv(config_path.parent / ".env")  # 配置文件旁
-    load_dotenv(Path.home() / ".autodl" / ".env")  # 全局兜底
+        load_dotenv(config_path.parent / ".env", override=True)  # 配置文件旁
+    found = find_dotenv(usecwd=True)  # cwd 及其父目录：项目本地，最高优先
+    if found:
+        load_dotenv(found, override=True)
 
 
 def load_config(explicit_path: str | None = None) -> Config:

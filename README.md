@@ -14,12 +14,12 @@ echo 'AUTODL_TOKEN=你的Token' > .env  # Token 只放环境变量/.env，不进
 cp autodl.example.yaml autodl.yaml    # 可选：改实例规格/区域/预算/SSH/git 仓库
 ```
 
-Token 在 AutoDL 控制台 → 账号 → 设置 → 开发者 Token 获取。**加载优先级**（前者覆盖后者）：
+Token 在 AutoDL 控制台 → 账号 → 设置 → 开发者 Token 获取。**加载优先级**（前者覆盖后者）——原则是**项目本地 `.env` 覆盖一切**，在哪个项目目录里跑就用哪个项目的 token：
 
-1. 已导出的环境变量：`AUTODL_TOKEN=... autodl run ...`
-2. 当前目录及其父目录里的 `.env`（项目本地）
-3. `autodl.yaml` 所在目录的 `.env`（`--config` 指到别处时跟着配置走）
-4. `~/.autodl/.env`（全局兜底：配一次，任意目录都能用）
+1. 当前目录及其父目录里的 `.env`（项目本地，最高——会覆盖已导出的全局环境变量）
+2. `autodl.yaml` 所在目录的 `.env`（`--config` 指到别处时跟着配置走）
+3. 已导出的环境变量：`export AUTODL_TOKEN=...`
+4. `~/.autodl/.env`（全局兜底：配一次，任意目录都能用，只补缺）
 
 ## 命令行快速上手
 
