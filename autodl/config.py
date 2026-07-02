@@ -38,6 +38,8 @@ class GitConfig:
     dir: str = ""        # 实例上的项目目录；留空 = <ssh.remote_workdir>/repo
     depth: int = 1       # 浅克隆深度（部署副本无需全历史，规避国内拉大仓库中断）；0=全克隆
     turbo: bool = True   # clone/fetch 前 source /etc/network_turbo（AutoDL 学术加速，对 github 有效）
+    patches: str = ""    # 本地 patch 目录（相对 autodl.yaml），clone/sync 后自动 git apply。
+                         # 改的是别人的仓库时用：适配补丁存你本地，只改实例工作区、绝不 commit/push。
 
 
 @dataclass

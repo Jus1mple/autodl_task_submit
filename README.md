@@ -94,6 +94,7 @@ info = tasks.refresh_run(ctx, run)         # 探活/tail/完成登记/抓指标
 | `clone [--repo URL]` | 在实例上克隆项目仓库（幂等；已有则 fetch）|
 | `sync [--mode M]` | 实例仓库从 remote 更新（本地 push 之后；见 git 工作流）|
 | `setup [--force] [--background]` | 按仓库依赖声明准备环境（hash 幂等，未变秒跳）|
+| `patch` | 把本地 patch 目录(git.patches)应用到实例（clone/sync 已自动带）|
 | `logs [--run-id R]` | 查看后台任务日志 + 退出码 + 指标 |
 | `runs [--limit N]` | 列出台账运行记录（含指标，只查本地）|
 | `push <本地目录> [子目录]` | rsync 同步本地到实例数据盘 |
@@ -150,6 +151,26 @@ autodl sync --json                       # 也可以单独更新不跑任务
 **约定**：训练产物/数据集写到仓库外（如 `~/autodl-tmp/outputs/`、指标写 `~/autodl-tmp/metrics.json`），仓库目录保持只读部署——这样 `sync` 永远是干净快进，产物也不会被任何策略碰到。产物用 `autodl pull outputs ./results` 拉回本地。
 
 私有仓库（https）：本地设 `AUTODL_GIT_TOKEN`，`clone` 时会把凭据写进实例的 `~/.git-credentials`（0600），token 不进命令行和日志。
+
+**改别人的仓库不想 push？用本地 patch 目录。** 当你 clone 的是别人的项目、需要打适配补丁（改依赖 import、桩掉用不到的模块、补字段——就像给 5090 适配一个官方栈跑不通的项目），把补丁存**你本地**，实例上只改工作区、**绝不 commit/push**：
+
+```yaml
+git:
+  repo: https://github.com/someone/their-project.git
+  patches: patches/     # 本地目录，放 *.patch（git diff 生成），用 NN-name.patch 控顺序
+```
+
+```bash
+# 生成 patch：在本地改好后 git diff > patches/01-fix.patch
+autodl clone            # clone 后自动 git apply 本地 patch（幂等）
+autodl patch            # 也可单独重放（调试 patch 时用）
+autodl sync             # 更新时：先 reset 回干净上游、拉最新、再重放 patch —— 永不累积
+autodl run --sync ...   # 一条龙：更新代码+重放patch → 跑
+```
+
+- patch 只改实例工作区、不进 git 历史 → 物理上不可能被推回别人的仓库。
+- `sync` 配了 patch 会自动用 reset 语义（丢弃上轮 patch、保留产物、重放新 patch）。
+- patch 冲突（上游改了补丁邻近行）会明确报出，让你更新 patch，而非 fuzzy 强应用到错位置。patch 目标行留足上下文（别贴文件边界）更稳。
 
 国内实例拉 GitHub 大仓库易因传输中断（GnuTLS/EOF）失败，`clone` 默认**浅克隆**（`git.depth: 1`，部署副本无需全历史）+ 走 **AutoDL 学术加速**（`git.turbo: true`，`source /etc/network_turbo`）+ 放宽慢速超时。需要全历史（如 `git describe`）改 `git.depth: 0`。后续 `sync` 的增量 fetch 不受深度限制，`ff` 快进照常可用。
 
