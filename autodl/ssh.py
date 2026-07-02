@@ -238,7 +238,7 @@ class SSHManager:
             sftp.close(); sftp = None
             # setsid 完全脱离会话；exit code 落 exit_file；pid 落 pid_file。路径一律转义。
             # prelude 在重定向之外执行，exit_file 只记任务本体的退出码。
-            inner = f"{prelude}{command} > {_shq(log_file)} 2>&1; echo $? > {_shq(exit_file)}"
+            inner = _bg_inner(prelude, command, log_file, exit_file)
             launch = (
                 f"setsid bash -c {_shq(inner)} "
                 f"</dev/null >/dev/null 2>&1 & echo $! > {_shq(pid_file)}; cat {_shq(pid_file)}"
@@ -361,6 +361,15 @@ class SSHManager:
 
 
 # ---------------- 小工具 ----------------
+def _bg_inner(prelude, command, log_file, exit_file):
+    """后台执行的内层脚本。command 必须包成**子 shell** ( … ) 再整体重定向：
+    - 不包组：`a; b; c` 链只有最后一个子命令的输出进日志（且会覆盖任务自己的重定向）
+    - 用 { } 组：命令里的 `exit N` 会杀掉外层 shell，exit_file 永远写不上
+    子 shell 两个问题都没有：输出全量进日志，exit N 变成子 shell 退出码。"""
+    return (f"{prelude}( {command}\n) > {_shq(log_file)} 2>&1; "
+            f"echo $? > {_shq(exit_file)}")
+
+
 def _exec(client, command, stream=None):
     """在已连接的 client 上执行命令。stream=None 时一次性读完；
     否则边跑边把输出块喂给 stream 回调（stdout/stderr 交错，返回值仍分开）。"""
