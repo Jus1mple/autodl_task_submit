@@ -8,6 +8,7 @@
   up [--select-region] 拉起/复用实例，注入公钥免密，写 ssh config，打印直连信息
   down [--release]     关机当前活动实例（--release 则释放）
   run --script F [--background]  上传脚本并执行（默认前台，--background 后台脱机）
+  clone / sync         在实例上克隆项目仓库 / 从 remote 更新（配合本地改码后 git push）
   logs [--run-id R]    查看后台任务日志 + 退出码 + 指标
   runs [--limit N]     列出台账里的运行记录（含指标）
   push LOCAL [SUB]     rsync 同步本地目录到实例数据盘
@@ -26,7 +27,7 @@ from pathlib import Path
 
 import yaml
 
-from . import monitor, scheduler, tasks
+from . import gitsync, monitor, scheduler, tasks
 from .config import load_config, require_token
 from .core import Context, billing_class
 from .errors import APIError, AutoDLError, ConfigError, InsufficientBalance, SSHUnavailable
@@ -172,6 +173,55 @@ def cmd_use(ctx, args):
     return EXIT_OK
 
 
+def _resolve_ready(ctx, instance):
+    """目标实例（--instance 或活动实例），确保 running（关机则开机）。返回 (uuid, snap)。"""
+    uuid = instance or ctx.reg.get_active()
+    if not uuid:
+        raise AutoDLError("没有目标实例：加 --instance，或先 autodl use / up")
+    return uuid, ctx.ensure_specific(uuid)
+
+
+def cmd_clone(ctx, args):
+    uuid, snap = _resolve_ready(ctx, args.instance)
+    res = gitsync.clone(ctx, snap, uuid, repo=args.repo, branch=args.branch, dir=args.dir)
+    if args.json:
+        print(json.dumps(res, ensure_ascii=False))
+        return EXIT_OK
+    print(("已克隆" if res["created"] else "已存在（已 fetch 最新）") + f": {res['dir']}  [{res['branch']}]")
+    print(f"  HEAD: {res['head']}")
+    if res["credentials"]:
+        print("  已写入私有仓库凭据（来自本地 AUTODL_GIT_TOKEN）")
+    return EXIT_OK
+
+
+def _print_sync(r, file=None):
+    file = file or sys.stdout
+    if r["blocked"]:
+        print(f"✗ 已拒绝更新（mode=ff）：{r['dir']} 有未提交改动：", file=file)
+        for line in r["dirty"]:
+            print(f"    {line}", file=file)
+        print("  处理：--mode stash（改动收进 stash）或 --mode reset（丢弃改动，保留未跟踪文件）",
+              file=file)
+    elif r["error"]:
+        print(f"✗ 更新失败：{r['error']}", file=file)
+    elif r["updated"]:
+        print(f"已更新 {r['old']} -> {r['new']}  [{r['branch']}]  {r['message']}", file=file)
+    else:
+        print(f"已是最新（{r['new']}）  [{r['branch']}]  {r['message']}", file=file)
+    if r["dirty"] and not r["blocked"]:
+        print(f"  （工作区有 {len(r['dirty'])} 处改动/未跟踪文件，已按 mode={r['mode']} 处理）", file=file)
+
+
+def cmd_sync(ctx, args):
+    uuid, snap = _resolve_ready(ctx, args.instance)
+    res = gitsync.sync(ctx, snap, uuid, mode=args.mode, dir=args.dir, branch=args.branch)
+    if args.json:
+        print(json.dumps(res, ensure_ascii=False))
+    else:
+        _print_sync(res)
+    return EXIT_OK if not (res["blocked"] or res["error"]) else EXIT_ERR
+
+
 def cmd_run(ctx, args):
     chosen = [(m, v) for m, v in (("script", args.script),
                                   ("remote_script", args.remote_script),
@@ -187,14 +237,31 @@ def cmd_run(ctx, args):
         return EXIT_USAGE
     if args.instance:
         ctx.use_instance(args.instance, log=None)  # 顺手登记为活动实例，之后 logs/down 默认用它
+    logf = _eprint if args.json else print
+
+    instance = args.instance
+    if args.sync:
+        # 跑之前把实例仓库更新到 remote 最新（缺仓库则按 git.repo 自动 clone）
+        tasks.check_balance(ctx)
+        if instance:
+            uuid0, snap0 = instance, ctx.ensure_specific(instance, log=logf)
+        else:
+            uuid0, snap0 = ctx.ensure_instance(select_region=args.select_region, log=logf)
+        res_sync = gitsync.update(ctx, snap0, uuid0, mode=args.sync_mode)
+        if res_sync["blocked"] or res_sync["error"]:
+            _print_sync(res_sync, file=sys.stderr)
+            print("sync 未完成，已中止运行（实例保持原样）。", file=sys.stderr)
+            return EXIT_ERR
+        logf(f"sync: {res_sync['old'] or '-'} -> {res_sync['new']}  {res_sync['message']}")
+        instance = uuid0
 
     teardown = "release" if args.release else ("power_off" if args.down else "keep")
     res = tasks.submit(
-        ctx, mode=mode, value=value, instance=args.instance,
+        ctx, mode=mode, value=value, instance=instance,
         select_region=args.select_region, background=args.background,
         teardown=teardown, run_id=args.name,
         stream=None if (args.json or args.background) else _print_chunk,
-        log=_eprint if args.json else print,
+        log=logf, check_balance_first=not args.sync,
     )
     if args.background:
         if args.json:
@@ -422,6 +489,21 @@ def build_parser():
     sp.add_argument("--select-region", action="store_true", help="按库存自动选区创建")
     sp.add_argument("--down", action="store_true", help="前台任务结束后关机（保留以便复用）")
     sp.add_argument("--release", action="store_true", help="前台任务结束后释放（彻底停止计费）")
+    sp.add_argument("--sync", action="store_true",
+                    help="运行前先把实例仓库更新到 remote 最新（缺仓库则按 git.repo 自动 clone）")
+    sp.add_argument("--sync-mode", choices=list(gitsync.SYNC_MODES), default="ff",
+                    help="--sync 的脏工作区策略（默认 ff：脏则拒绝）")
+    sp = add("clone", help="在实例上克隆项目仓库（幂等；已有则 fetch）")
+    sp.add_argument("--repo", help="仓库 URL（默认 autodl.yaml 的 git.repo）")
+    sp.add_argument("--branch", help="分支（默认 git.branch）")
+    sp.add_argument("--dir", help="实例上的目录（默认 <数据盘>/repo）")
+    sp.add_argument("--instance", help="目标实例（默认活动实例）")
+    sp = add("sync", help="实例仓库从 remote 更新（本地改码 git push 之后跑这个）")
+    sp.add_argument("--mode", choices=list(gitsync.SYNC_MODES), default="ff",
+                    help="脏工作区策略：ff=脏则拒绝 / stash=改动收进 stash / reset=丢弃改动(保留未跟踪文件)")
+    sp.add_argument("--branch", help="分支（默认 git.branch）")
+    sp.add_argument("--dir", help="实例上的目录（默认 <数据盘>/repo）")
+    sp.add_argument("--instance", help="目标实例（默认活动实例）")
     sp = add("logs", help="查看后台任务日志 + 退出码 + 指标")
     sp.add_argument("--run-id", help="指定 run_id（默认最近一个）")
     sp.add_argument("--lines", type=int, default=50, help="tail 行数")
@@ -465,7 +547,8 @@ def build_parser():
 _DISPATCH = {
     "balance": cmd_balance, "stock": cmd_stock, "status": cmd_status, "ls": cmd_status,
     "stop-all": cmd_stop_all, "up": cmd_up, "down": cmd_down, "use": cmd_use, "run": cmd_run,
-    "logs": cmd_logs, "runs": cmd_runs, "push": cmd_push, "pull": cmd_pull,
+    "logs": cmd_logs, "runs": cmd_runs, "clone": cmd_clone, "sync": cmd_sync,
+    "push": cmd_push, "pull": cmd_pull,
     "snapshot-env": cmd_snapshot_env, "idle-guard": cmd_idle_guard,
     "balance-watch": cmd_balance_watch, "batch": cmd_batch,
 }

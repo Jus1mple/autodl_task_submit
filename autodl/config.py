@@ -1,7 +1,11 @@
 """配置：从 YAML 文件 + 环境变量(.env) 加载，去掉源码里的硬编码常量。
 
-优先级：环境变量(仅 token) > YAML 文件 > 内置默认值。
-Token 永远只从环境变量 AUTODL_TOKEN 读，绝不写进 YAML（避免泄漏/误提交）。
+Token 永远只从环境变量读，绝不写进 YAML（避免泄漏/误提交）。加载优先级：
+  1. 已导出的环境变量（AUTODL_TOKEN=... autodl run ...）
+  2. 当前目录及其父目录里的 .env（项目本地）
+  3. autodl.yaml 所在目录的 .env（--config 指到别处时跟着配置走）
+  4. ~/.autodl/.env（全局兜底，任意目录都能用）
+.env 只补缺不覆盖：先加载到的值优先，真环境变量永远最大。
 """
 from __future__ import annotations
 
@@ -10,7 +14,7 @@ from dataclasses import dataclass, field, fields, is_dataclass
 from pathlib import Path
 
 import yaml
-from dotenv import load_dotenv
+from dotenv import find_dotenv, load_dotenv
 
 from .errors import ConfigError
 
@@ -23,6 +27,14 @@ class HTTPConfig:
     timeout_read: float = 30.0
     retries: int = 3        # 仅对幂等读接口生效；写接口（create/power_*/release）不自动重试
     backoff: float = 1.5    # 指数退避基数（秒）
+
+
+@dataclass
+class GitConfig:
+    """实例上的项目仓库（autodl clone / sync 用）。"""
+    repo: str = ""       # 远端仓库 URL（https/ssh）；私有 https 库配合环境变量 AUTODL_GIT_TOKEN
+    branch: str = "main"
+    dir: str = ""        # 实例上的项目目录；留空 = <ssh.remote_workdir>/repo
 
 
 @dataclass
@@ -53,6 +65,7 @@ class Config:
     registry_path: str = ".autodl/registry.db"
     http: HTTPConfig = field(default_factory=HTTPConfig)
     ssh: SSHConfig = field(default_factory=SSHConfig)
+    git: GitConfig = field(default_factory=GitConfig)
 
     # 运行时填充（不来自 YAML）
     token: str = field(default="", repr=False)
@@ -95,8 +108,19 @@ def find_config_file(explicit: str | None = None) -> Path | None:
     return None
 
 
+def _load_env_files(config_path: Path | None):
+    """按优先级加载 .env（load_dotenv 只补缺不覆盖，已存在的环境变量永远优先）。
+    注意必须 usecwd=True：默认的 find_dotenv 从本模块（site-packages）位置向上找，
+    pip 安装后会找不到项目里的 .env。"""
+    found = find_dotenv(usecwd=True)  # cwd 及其父目录
+    if found:
+        load_dotenv(found)
+    if config_path is not None:
+        load_dotenv(config_path.parent / ".env")  # 配置文件旁
+    load_dotenv(Path.home() / ".autodl" / ".env")  # 全局兜底
+
+
 def load_config(explicit_path: str | None = None) -> Config:
-    load_dotenv()  # 读取 .env 里的 AUTODL_TOKEN
     cfg = Config()
     path = find_config_file(explicit_path)
     if path is not None:
@@ -104,6 +128,7 @@ def load_config(explicit_path: str | None = None) -> Config:
             data = yaml.safe_load(f) or {}
         _merge_into(cfg, data)
         cfg._base_dir = path.parent
+    _load_env_files(path)
     cfg.token = os.getenv("AUTODL_TOKEN", "")
     return cfg
 
