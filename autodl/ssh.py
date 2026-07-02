@@ -112,12 +112,13 @@ class SSHManager:
         raise self._classify_failure(last, instance_uuid)
 
     # ---------------- 同步执行 ----------------
-    def run(self, snapshot, command, instance_uuid=None, stream=None):
+    def run(self, snapshot, command, instance_uuid=None, stream=None, max_capture=None):
         """同步执行一条命令，返回 (stdout, stderr, exit_code)。
-        stream: 可选回调，边执行边收到输出块（长任务实时回显）；stdout/stderr 都会喂给它。"""
+        stream: 可选回调，边执行边收到输出块（长任务实时回显）；stdout/stderr 都会喂给它。
+        max_capture: 累积到内存的 stdout/stderr 各自只保留末尾约这么多字符（防大输出 OOM）。"""
         client = self.connect(snapshot, instance_uuid)
         try:
-            return _exec(client, command, stream)
+            return _exec(client, command, stream, max_capture)
         finally:
             client.close()
 
@@ -201,9 +202,11 @@ class SSHManager:
             client.close()
 
     # ---------------- 后台非阻塞执行 ----------------
-    def run_script(self, snapshot, script_text, run_id, instance_uuid=None, prelude="", stream=None):
+    def run_script(self, snapshot, script_text, run_id, instance_uuid=None, prelude="",
+                   stream=None, max_capture=None):
         """上传一段脚本到数据盘并**同步**执行，返回 (stdout, stderr, exit_code)。
-        prelude: 在脚本前于同一 shell 里执行的命令（如清理旧 metrics.json），以 ';' 结尾。"""
+        prelude: 在脚本前于同一 shell 里执行的命令（如清理旧 metrics.json），以 ';' 结尾。
+        max_capture: 见 run()——限制累积到内存的输出量，防大输出 OOM。"""
         run_id = _safe_run_id(run_id)
         wd = self.cfg.remote_workdir
         task = f"{wd}/task_{run_id}.sh"
@@ -215,7 +218,7 @@ class SSHManager:
             with sftp.open(task, "w") as f:
                 f.write(script_text)
             sftp.close(); sftp = None
-            return _exec(client, f"{prelude}bash {task}", stream)
+            return _exec(client, f"{prelude}bash {task}", stream, max_capture)
         finally:
             if sftp:
                 sftp.close()
@@ -370,29 +373,62 @@ def _bg_inner(prelude, command, log_file, exit_file):
             f"echo $? > {_shq(exit_file)}")
 
 
-def _exec(client, command, stream=None):
-    """在已连接的 client 上执行命令。stream=None 时一次性读完；
-    否则边跑边把输出块喂给 stream 回调（stdout/stderr 交错，返回值仍分开）。"""
+class _TailBuf:
+    """累积输出，可选只保留末尾约 limit 个字符（None=不限）。
+    超过 2×limit 才裁剪一次（均摊 O(1)）；截断时 text() 前置一行标记。"""
+    def __init__(self, limit=None):
+        self.limit = limit
+        self.parts = []
+        self.n = 0
+        self.truncated = False
+
+    def add(self, chunk):
+        self.parts.append(chunk)
+        self.n += len(chunk)
+        if self.limit and self.n > self.limit * 2:
+            merged = "".join(self.parts)[-self.limit:]
+            self.parts, self.n, self.truncated = [merged], len(merged), True
+
+    def text(self):
+        s = "".join(self.parts)
+        if self.truncated:
+            s = (f"[autodl] 输出过大已截断，仅保留末尾约 {self.limit} 字符；"
+                 f"完整日志请改用 --background 后 autodl logs\n") + s
+        return s
+
+
+def _exec(client, command, stream=None, max_capture=None):
+    """在已连接的 client 上执行命令，返回 (stdout, stderr, exit_code)。
+    - stream=None 且无 max_capture：一次性读完（快路径，用于已知小输出的内部调用）。
+    - stream：边跑边把输出块喂给回调实时回显；回显本身不受 max_capture 限制。
+    - max_capture：累积到内存的 stdout/stderr 各自只保留末尾约这么多字符，防止
+      巨量输出（训练日志几个 GB）把前台调用的本地内存撑爆。"""
     _in, out, err = client.exec_command(command)
-    if stream is None:
+    if stream is None and max_capture is None:
         so = out.read().decode("utf-8", "replace")
         se = err.read().decode("utf-8", "replace")
         return so, se, out.channel.recv_exit_status()
     chan = out.channel
-    so_parts, se_parts = [], []
+    so, se = _TailBuf(max_capture), _TailBuf(max_capture)
     while True:
         got = False
         while chan.recv_ready():
             chunk = chan.recv(4096).decode("utf-8", "replace")
-            so_parts.append(chunk); stream(chunk); got = True
+            so.add(chunk)
+            if stream:
+                stream(chunk)
+            got = True
         while chan.recv_stderr_ready():
             chunk = chan.recv_stderr(4096).decode("utf-8", "replace")
-            se_parts.append(chunk); stream(chunk); got = True
+            se.add(chunk)
+            if stream:
+                stream(chunk)
+            got = True
         if chan.exit_status_ready() and not chan.recv_ready() and not chan.recv_stderr_ready():
             break
         if not got:
             time.sleep(0.1)
-    return "".join(so_parts), "".join(se_parts), chan.recv_exit_status()
+    return so.text(), se.text(), chan.recv_exit_status()
 
 
 def _shq(s: str) -> str:
