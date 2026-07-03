@@ -153,6 +153,8 @@ autodl sync --json                       # 也可以单独更新不跑任务
 
 私有仓库（https）：本地设 `AUTODL_GIT_TOKEN`，`clone` 时会把凭据写进实例的 `~/.git-credentials`（0600），token 不进命令行和日志。
 
+> 完整实战样例见 [`examples/vlm-r1-refcoco/`](examples/vlm-r1-refcoco/)：用 autodl 把官方 VLM-R1 的 REC 训练在单卡 5090 上端到端跑通（clone → 打 5090 适配补丁 → 装环境 → 备真实 RefCOCOg 数据 → GRPO-LoRA 训练 → `--pull` 拉回 adapter），Qwen2.5-VL-3B 实测 IoU 0.11→0.67、format 0→1.0。
+
 **改别人的仓库不想 push？用本地 patch 目录。** 当你 clone 的是别人的项目、需要打适配补丁（改依赖 import、桩掉用不到的模块、补字段——就像给 5090 适配一个官方栈跑不通的项目），把补丁存**你本地**，实例上只改工作区、**绝不 commit/push**：
 
 ```yaml
