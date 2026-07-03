@@ -34,20 +34,30 @@ autodl logs --run-id train                 # 完成时自动拉回 adapter + met
 
 # 5) 看结果（指标已入本地台账，关机也不丢）
 autodl runs --json | jq '.runs[0].metrics'
+
+# 6) 评估效果：对比 base vs 训练后模型的定位准确度
+autodl run --script examples/vlm-r1-refcoco/eval.sh --name eval
 autodl down --yes                          # 关机（保留环境，下次秒开复用）
 ```
 
 数据量可调：`prepare_data.sh` 的 `N_SAMPLES`（默认 2000）、`train.sh` 的 `STEPS`（默认 200）/ `MODEL`（默认 Qwen2.5-VL-3B）/ `NUM_GEN` / `MAX_PIXELS`。显存不够就调小 `NUM_GEN` 或 `MAX_PIXELS`（真实 COCO 图分辨率高）。
 
-## 实测结果（Qwen2.5-VL-3B，60 步，真实 RefCOCOg）
+## 实测结果（Qwen2.5-VL-3B，2000 样本，200 步，真实 RefCOCOg）
 
-教科书式的 GRPO 学习曲线——format 先学会，IoU（定位准确度）随后爬升：
+教科书式的 GRPO 学习曲线——format 前 30 步先学会（升到 1.0），IoU（定位准确度）随后爬升到 0.8：
 
 | 指标 | 起点 → 终点 | 峰值 |
 |---|---|---|
-| reward（format + IoU） | 0.11 → 1.67 | 1.93 |
-| IoU（定位准确度） | 0.11 → 0.67 | 0.93 |
+| reward（format + IoU） | 0.11 → 1.80 | 1.95 |
+| IoU（定位准确度） | 0.11 → 0.80 | 0.95 |
 | format（格式遵循） | 0 → 1.0 | 1.0 |
+
+**效果评估**（`eval.sh`，held-out 15 条测试样本，base vs 训练后）：
+
+| | 平均 IoU | IoU>0.5 命中率 |
+|---|---|---|
+| base Qwen2.5-VL-3B（未训练） | 0.518 | 47% |
+| **trained（200 步 LoRA）** | **0.713** | **73%** |
 
 对照：换成 Qwen2-VL-**2B** 时 reward 始终为 0（模型不遵循 `<think></think><answer>{...[bbox]...}</answer>` 格式）——同样的流程，模型规模不够就训不动。所以这台 32G 单卡上，**Qwen2.5-VL-3B + LoRA** 是甜点。
 
@@ -57,3 +67,4 @@ autodl down --yes                          # 关机（保留环境，下次秒�
 - `patches/01-5090-adapt.patch` —— 桩掉 GLM 模块 + flash-attn monkey-patch（从官方仓库 `git diff` 生成）
 - `prepare_data.sh` —— 下 RefCOCOg 标注 + 解压 COCO 子集
 - `train.sh` —— Qwen2.5-VL-3B GRPO-LoRA 训练（官方 `grpo_jsonl.py` + 官方参数，单卡适配）
+- `eval.sh` —— 对比 base vs 训练后模型的定位准确度（IoU）
