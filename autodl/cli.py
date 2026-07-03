@@ -383,6 +383,44 @@ def cmd_run(ctx, args):
     return EXIT_OK if res["exit_code"] == 0 else EXIT_TASK
 
 
+def _follow_logs(ctx, run):
+    """实时跟随后台任务日志到完成（tail -f 式），结束后抓指标并拉产物。Ctrl-C 停跟随不停任务。"""
+    uuid = run.get("instance_uuid")
+    lp, ef = run.get("log_path"), run.get("exit_file")
+    if not lp or lp == "(sync)" or not ef:
+        print("该 run 不是后台任务，无日志文件可跟随（前台任务本就实时回显）。", file=sys.stderr)
+        return EXIT_USAGE
+    if ctx.api.status_or_none(uuid) != "running":
+        print("实例非 running，无法实时跟随；改为显示最后快照：", file=sys.stderr)
+        info = tasks.refresh_run(ctx, run, lines=100)
+        if info["log"]:
+            print(info["log"])
+        return EXIT_OK
+    print(f"--- 实时跟随 {run['run_id']}（Ctrl-C 停止跟随，不影响后台任务）---", file=sys.stderr)
+    try:
+        ctx.ssh.follow(ctx.api.snapshot(uuid), lp, ef, run.get("pid"),
+                       lines=100, stream=_print_chunk, instance_uuid=uuid)
+    except KeyboardInterrupt:
+        print("\n（已停止跟随，任务仍在后台运行；autodl logs 可再看）", file=sys.stderr)
+        return EXIT_OK
+    except (SSHUnavailable, AutoDLError) as e:
+        print(f"\n跟随中断：{e}", file=sys.stderr)
+    # 任务结束：刷新一次抓指标 + 拉产物
+    info = tasks.refresh_run(ctx, run, lines=0)
+    cur = ctx.reg.get_run(run["run_id"]) or run
+    m = ctx.reg.get_metrics(run["run_id"])
+    line = f"\n--- 状态: {cur['status']}"
+    if cur.get("exit_code") is not None:
+        line += f" 退出码={cur['exit_code']}"
+    print(line + " ---", file=sys.stderr)
+    if m:
+        print("指标: " + json.dumps(m, ensure_ascii=False), file=sys.stderr)
+    if info.get("artifacts"):
+        a = info["artifacts"]
+        print(f"产物已拉回 {len(a['files'])} 项 -> {a['local_dir']}", file=sys.stderr)
+    return EXIT_OK if cur.get("exit_code") in (0, None) else EXIT_TASK
+
+
 def cmd_logs(ctx, args):
     if args.run_id:
         run = ctx.reg.get_run(args.run_id)
@@ -397,6 +435,8 @@ def cmd_logs(ctx, args):
         run = runs[-1]
         if not args.json:
             print(f"(最近任务 run_id={run['run_id']})")
+    if getattr(args, "follow", False):
+        return _follow_logs(ctx, run)
     info = tasks.refresh_run(ctx, run, lines=args.lines)
     cur = ctx.reg.get_run(run["run_id"]) or run
     m = ctx.reg.get_metrics(run["run_id"])
@@ -641,9 +681,11 @@ def build_parser():
     sp.add_argument("--background", action="store_true", help="后台安装（之后 autodl logs 查进度）")
     sp.add_argument("--dir", help="仓库目录（默认 <数据盘>/repo）")
     sp.add_argument("--instance", help="目标实例（默认活动实例）")
-    sp = add("logs", help="查看后台任务日志 + 退出码 + 指标")
+    sp = add("logs", help="查看后台任务日志 + 退出码 + 指标（--follow 实时跟随）")
     sp.add_argument("--run-id", help="指定 run_id（默认最近一个）")
     sp.add_argument("--lines", type=int, default=50, help="tail 行数")
+    sp.add_argument("--follow", "-f", action="store_true",
+                    help="实时跟随日志到任务完成（tail -f 式，Ctrl-C 停跟随不停任务）")
     sp = add("runs", help="列出台账里的运行记录（含指标，只查本地不触网）")
     sp.add_argument("--limit", type=int, default=20, help="最多显示条数（0=全部）")
     sp = add("snapshot-env", help="把实例环境存为私有镜像（会持续占存储费）")

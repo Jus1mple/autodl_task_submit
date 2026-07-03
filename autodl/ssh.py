@@ -309,6 +309,19 @@ class SSHManager:
         so, _se, _c = self.run(snapshot, f"tail -n {int(lines)} {_shq(log_file)} 2>/dev/null", instance_uuid)
         return so
 
+    def follow(self, snapshot, log_file, exit_file, pid, lines=40, stream=None, instance_uuid=None):
+        """实时跟随后台任务日志（tail -f），任务结束（exit_file 出现或 pid 消失）后自动退出。
+        输出通过 stream 回调实时回显（tqdm 进度条会随 \\r 刷新）。阻塞直到任务完成或连接断开。
+        跟随命令随 SSH 连接断开而终止，但任务本体是 setsid 脱离会话的，不受影响。"""
+        pid = (pid or "").strip()
+        cond = f"[ ! -f {_shq(exit_file)} ]"
+        if pid.isdigit():
+            cond += f" && kill -0 {pid} 2>/dev/null"
+        # tail -f 后台跟随；主循环等任务结束；再 sleep 让最后输出 flush，然后收掉 tail
+        cmd = (f"tail -n {int(lines)} -f {_shq(log_file)} 2>/dev/null & TP=$!; "
+               f"while {cond}; do sleep 2; done; sleep 3; kill $TP 2>/dev/null; true")
+        return self.run(snapshot, cmd, instance_uuid, stream=stream, max_capture=1)
+
     def gpu_brief(self, snapshot, instance_uuid=None):
         cmd = ("nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total "
                "--format=csv,noheader,nounits 2>/dev/null || echo NA")

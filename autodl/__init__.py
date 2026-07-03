@@ -27,7 +27,7 @@ from .errors import (APIError, AutoDLError, ConfigError, InsufficientBalance,
                      RateLimited, SSHUnavailable)
 from .tasks import submit
 
-__version__ = "1.10.0"
+__version__ = "1.11.0"
 
 __all__ = [
     "connect", "submit", "Context", "Config", "load_config", "require_token",
