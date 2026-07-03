@@ -9,6 +9,7 @@
 """
 from __future__ import annotations
 
+import os
 import queue
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -21,14 +22,21 @@ def _run_job(ctx, snap, uuid, job, batch_id, retries, log, widx):
     """跑一个 job（记台账 + 重试 + 抓指标都在 tasks.run_foreground 里）。返回退出码。"""
     rid = f"{batch_id}:{job['id']}"
     wlog = (lambda m: log(f"[w{widx}] {m}")) if log else None
+    # 每个 job 的产物拉回各自子目录：<pull_to>/<job_id>/，避免多任务互相覆盖
+    art = None
+    if job.get("pull"):
+        art = {"patterns": job["pull"],
+               "local_dir": os.path.join(job.get("pull_to") or "./results", str(job["id"]))}
     try:
         res = tasks.run_foreground(
             ctx, snap, uuid, mode=job["mode"], value=job["value"], run_id=rid,
-            name=job["id"], retries=retries, tag=batch_id,
+            name=job["id"], retries=retries, tag=batch_id, artifacts=art,
             config_extra={"script": job["display"]} if job.get("display") else None,
             log=wlog,
         )
         code = res["exit_code"]
+        if res.get("artifacts") and wlog:
+            wlog(f"job {job['id']} 产物拉回 {len(res['artifacts']['files'])} 项 -> {res['artifacts']['local_dir']}")
     except SSHUnavailable as e:
         code = -1
         if wlog:
