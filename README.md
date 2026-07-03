@@ -154,7 +154,7 @@ autodl sync --json                       # 也可以单独更新不跑任务
 
 私有仓库（https）：本地设 `AUTODL_GIT_TOKEN`，`clone` 时会把凭据写进实例的 `~/.git-credentials`（0600），token 不进命令行和日志。
 
-> 完整实战样例见 [`examples/vlm-r1-refcoco/`](examples/vlm-r1-refcoco/)：用 autodl 把官方 VLM-R1 的 REC 训练在单卡 5090 上端到端跑通（clone → 打 5090 适配补丁 → 装环境 → 备真实 RefCOCOg 数据 → GRPO-LoRA 训练 → `--pull` 拉回 adapter → 评估效果）。Qwen2.5-VL-3B 训 200 步：训练 IoU 0.11→0.80、format 0→1.0；held-out 测试定位准确度 base 0.52 → trained 0.71，IoU>0.5 命中率 47%→73%。
+> 完整实战样例见 [`examples/vlm-r1-refcoco/`](examples/vlm-r1-refcoco/)：用 autodl 把官方 VLM-R1 的 REC 训练在单卡 5090 上端到端跑通（clone → 打 5090 适配补丁 → 装环境 → 备真实 RefCOCOg 数据 → GRPO-LoRA 训练 → `--pull` 拉回 adapter → 评估效果）。Qwen2.5-VL-3B 训 500 步（8000 真实样本，对齐官方发布训练量，单卡 2.5h）：held-out 定位准确度 base 0.52 → **0.835**，IoU>0.5 命中率 55% → **85%**。
 
 **改别人的仓库不想 push？用本地 patch 目录。** 当你 clone 的是别人的项目、需要打适配补丁（改依赖 import、桩掉用不到的模块、补字段——就像给 5090 适配一个官方栈跑不通的项目），把补丁存**你本地**，实例上只改工作区、**绝不 commit/push**：
 
