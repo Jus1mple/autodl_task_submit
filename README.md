@@ -34,7 +34,8 @@ autodl run --remote-script ~/proj/submit_exec.sh --down        # 前台实时回
 
 ```bash
 autodl run --remote-script ~/proj/train.sh --background        # 立即返回 run_id
-autodl logs --run-id <run_id>                                  # tail 日志 + 状态 + 指标
+autodl logs --run-id <run_id>                                  # tail 日志 + 状态 + 指标（快照）
+autodl logs --run-id <run_id> -f                               # 实时跟随到完成（Ctrl-C 停跟随不停任务）
 ```
 
 ## 拿回数据（--json）
@@ -95,7 +96,7 @@ info = tasks.refresh_run(ctx, run)         # 探活/tail/完成登记/抓指标
 | `sync [--mode M]` | 实例仓库从 remote 更新（本地 push 之后；见 git 工作流）|
 | `setup [--force] [--background]` | 按仓库依赖声明准备环境（hash 幂等，未变秒跳）|
 | `patch` | 把本地 patch 目录(git.patches)应用到实例（clone/sync 已自动带）|
-| `logs [--run-id R]` | 查看后台任务日志 + 退出码 + 指标 |
+| `logs [--run-id R] [-f]` | 查看后台任务日志 + 退出码 + 指标；`-f/--follow` 实时跟随到完成 |
 | `runs [--limit N]` | 列出台账运行记录（含指标，只查本地）|
 | `push <本地目录> [子目录]` | rsync 同步本地到实例数据盘 |
 | `pull <远端子路径> [本地目录]` | rsync 从实例拉回产物 |
