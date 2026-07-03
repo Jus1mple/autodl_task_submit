@@ -1,0 +1,31 @@
+# VLM-R1 REC 训练样例配置。复制到项目根为 autodl.yaml 后使用。
+# Token 放 .env 的 AUTODL_TOKEN=...（不进 yaml）。
+
+# 官方 VLM-R1 仓库（公开，https 免凭据）
+git:
+  repo: https://github.com/om-ai-lab/VLM-R1.git
+  branch: main
+  dir: /root/autodl-tmp/vlm-r1
+  depth: 1
+  turbo: true              # 国内实例走 AutoDL 学术加速拉 GitHub
+  patches: examples/vlm-r1-refcoco/patches   # clone/sync 后自动 git apply（本地适配，不 push）
+
+# 5090(Blackwell) 适配环境：官方栈 torch2.5+cu124+flash-attn 在 sm_120 跑不通，
+# 这里装支持 5090 的新版 torch + 项目核心依赖(transformers==4.49.0 由 -e ".[dev]" 钉住) +
+# grpo_jsonl.py 需要的额外库；跳过 flash-attn(用 sdpa)与 vllm(GRPO 训练不强制)。
+env:
+  setup: |
+    set -e
+    if [ ! -d /root/miniconda3 ]; then
+      wget -q https://mirrors.tuna.tsinghua.edu.cn/anaconda/miniconda/Miniconda3-latest-Linux-x86_64.sh -O /tmp/mc.sh
+      bash /tmp/mc.sh -b -p /root/miniconda3 && rm -f /tmp/mc.sh
+    fi
+    . /root/miniconda3/etc/profile.d/conda.sh
+    conda activate base
+    PIP="pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple"
+    $PIP torch torchvision
+    cd /root/autodl-tmp/vlm-r1/src/open-r1-multimodal
+    $PIP -e ".[dev]"
+    $PIP qwen_vl_utils wandb peft
+    $PIP babel json_repair openai pycocotools python-Levenshtein matplotlib tensorboardx
+    python -c "import torch,transformers,trl,peft; print('torch',torch.__version__,'cuda',torch.cuda.is_available(),'| transformers',transformers.__version__)"
