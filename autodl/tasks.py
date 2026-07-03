@@ -74,12 +74,38 @@ def check_balance(ctx):
     return bal
 
 
-def _run_config(run_id, name, command, metrics_file, metrics_spec, config_yaml, config_extra):
+def _run_config(run_id, name, command, metrics_file, metrics_spec, config_yaml, config_extra,
+                artifacts=None):
     cfg_d = {"name": name or run_id, "command": command or "(script)",
              "metrics_file": metrics_file, "metrics_spec": metrics_spec or [],
              "config_yaml": config_yaml or ""}
+    if artifacts and artifacts.get("patterns") and artifacts.get("local_dir"):
+        cfg_d["artifacts"] = {"patterns": artifacts["patterns"], "local_dir": artifacts["local_dir"]}
     cfg_d.update(config_extra or {})
     return cfg_d
+
+
+def collect_artifacts(ctx, snap, uuid, spec, log=None):
+    """按 spec={'patterns','local_dir'} 从实例拉回结果文件（glob）。失败不致命，返回结果或 None。
+    需要 SSH 密钥（rsync）——拉回时机与自动抓指标一致（前台完成 / 后台 refresh 检测到 done）。"""
+    if not spec or not spec.get("patterns") or not spec.get("local_dir"):
+        return None
+    try:
+        key = ctx.ssh.ensure_key_access(snap, uuid)
+        if not key:
+            if log:
+                log("  ⚠️ 无 SSH 密钥，跳过产物拉回")
+            return None
+        res = ctx.ssh.pull_artifacts(snap, spec["patterns"], spec["local_dir"], key, instance_uuid=uuid)
+        if log:
+            n = len(res["files"])
+            log(f"  产物拉回 {n} 项 -> {res['local_dir']}" if n else
+                f"  产物拉回：无文件匹配 {spec['patterns']}")
+        return res
+    except Exception as e:  # noqa: BLE001 - 拉产物失败绝不该让任务失败
+        if log:
+            log(f"  ⚠️ 产物拉回失败: {e}")
+        return None
 
 
 def _prepare(ctx, snap, uuid, mode, value, config_yaml):
@@ -96,14 +122,14 @@ def _prepare(ctx, snap, uuid, mode, value, config_yaml):
 # ---------------- 执行：前台 / 后台 ----------------
 def run_foreground(ctx, snap, uuid, *, mode, value, run_id, name=None, retries=0,
                    config_yaml=None, metrics_spec=None, config_extra=None,
-                   experiment_id=None, tag=None, stream=None, log=None):
-    """同步执行并等结果。全程记入 registry（此前前台运行不进台账），结束后抓指标。
-    返回 {run_id, exit_code, stdout, stderr, instance}。
+                   experiment_id=None, tag=None, artifacts=None, stream=None, log=None):
+    """同步执行并等结果。全程记入 registry（此前前台运行不进台账），结束后抓指标 + 拉产物。
+    返回 {run_id, exit_code, stdout, stderr, instance, artifacts}。
     最后一次尝试若 SSH 不可达则登记失败后抛 SSHUnavailable（调用方可分流退出码）。"""
     command, metrics_file, prelude = _prepare(ctx, snap, uuid, mode, value, config_yaml)
     ctx.reg.record_run(run_id, uuid,
                        _run_config(run_id, name, command, metrics_file, metrics_spec,
-                                   config_yaml, config_extra),
+                                   config_yaml, config_extra, artifacts),
                        "(sync)", "", "", experiment_id=experiment_id, tag=tag)
     out = err = ""
     code = None
@@ -129,14 +155,16 @@ def run_foreground(ctx, snap, uuid, *, mode, value, run_id, name=None, retries=0
     ctx.reg.finish_run(run_id, code if code is not None else -1)
     extract_metrics(ctx, snap, uuid, run_id, metrics_spec, metrics_file,
                     log_text=f"{out}\n{err}")
-    return {"run_id": run_id, "exit_code": code, "stdout": out, "stderr": err, "instance": uuid}
+    art = collect_artifacts(ctx, snap, uuid, artifacts, log=log) if artifacts else None
+    return {"run_id": run_id, "exit_code": code, "stdout": out, "stderr": err,
+            "instance": uuid, "artifacts": art}
 
 
 def run_background(ctx, snap, uuid, *, mode, value, run_id, name=None,
                    config_yaml=None, metrics_spec=None, config_extra=None,
-                   experiment_id=None, tag=None):
+                   experiment_id=None, tag=None, artifacts=None):
     """后台脱机执行，立即返回 {run_id, pid, log, exit_file, workdir, instance}。
-    之后用 refresh_run()（logs 命令等）判定完成并抓指标。"""
+    之后用 refresh_run()（logs 命令等）判定完成并抓指标 + 拉产物（artifacts 存进 config）。"""
     command, _metrics_file, prelude = _prepare(ctx, snap, uuid, mode, value, config_yaml)
     remote_id = ascii_id(run_id)
     if command is None:
@@ -145,7 +173,7 @@ def run_background(ctx, snap, uuid, *, mode, value, run_id, name=None,
         meta = ctx.ssh.run_background_command(snap, command, remote_id, uuid, prelude=prelude)
     ctx.reg.record_run(run_id, uuid,
                        _run_config(run_id, name, command, _metrics_file, metrics_spec,
-                                   config_yaml, config_extra),
+                                   config_yaml, config_extra, artifacts),
                        meta["log"], meta["exit_file"], meta["pid"],
                        experiment_id=experiment_id, tag=tag)
     return {"run_id": run_id, "instance": uuid, **meta}
@@ -159,7 +187,8 @@ def refresh_run(ctx, run, lines=100):
     指标幂等补抽：抓指标只在任务完成那一刻做一次，若那时 SSH 抖动/实例已关就会漏。
     这里对「已完成但台账里还没有指标」的 run，只要实例还能连就再抽一次——metrics.json
     在数据盘上一直都在，补抽把「一次性」变成「可重试」。实例已关时给出明确指引而非静默空。"""
-    out = {"state": run.get("status"), "exit_code": run.get("exit_code"), "log": "", "note": ""}
+    out = {"state": run.get("status"), "exit_code": run.get("exit_code"), "log": "", "note": "",
+           "artifacts": None}
     uuid = run.get("instance_uuid")
     if not uuid:
         out["note"] = "run 无实例信息"
@@ -182,6 +211,8 @@ def refresh_run(ctx, run, lines=100):
                 ctx.reg.finish_run(run["run_id"], code if code is not None else -1)
                 extract_metrics(ctx, snap, uuid, run["run_id"], cfg_d.get("metrics_spec"),
                                 cfg_d.get("metrics_file"), log_path=run.get("log_path"))
+                # 任务刚完成：把声明的结果文件拉回本地（与自动抓指标同一时机）
+                out["artifacts"] = collect_artifacts(ctx, snap, uuid, cfg_d.get("artifacts"))
                 out["state"], out["exit_code"] = "done", code
             else:
                 out["state"] = "running"
@@ -267,7 +298,7 @@ def extract_metrics(ctx, snap, uuid, run_id, metrics_spec=None, metrics_file=Non
 # ---------------- 一站式提交 ----------------
 def submit(ctx, *, mode, value, instance=None, select_region=False, background=False,
            teardown="keep", run_id=None, name=None, config_yaml=None, metrics_spec=None,
-           config_extra=None, experiment_id=None, tag=None, retries=0,
+           config_extra=None, experiment_id=None, tag=None, retries=0, artifacts=None,
            check_balance_first=True, stream=None, log=print):
     """一站式提交：余额护栏 → 起/复用实例 → 执行 → （前台）按需收尾。
 
@@ -298,7 +329,8 @@ def submit(ctx, *, mode, value, instance=None, select_region=False, background=F
         try:
             return run_background(ctx, snap, uuid, mode=mode, value=value, run_id=rid,
                                   name=name, config_yaml=config_yaml, metrics_spec=metrics_spec,
-                                  config_extra=config_extra, experiment_id=experiment_id, tag=tag)
+                                  config_extra=config_extra, experiment_id=experiment_id, tag=tag,
+                                  artifacts=artifacts)
         except (SSHUnavailable, OSError) as e:
             # 实例已就绪（可能是本次刚创建的），但任务没起来——绝不能静默放任计费
             if log:
@@ -314,7 +346,7 @@ def submit(ctx, *, mode, value, instance=None, select_region=False, background=F
         return run_foreground(ctx, snap, uuid, mode=mode, value=value, run_id=rid, name=name,
                               retries=retries, config_yaml=config_yaml, metrics_spec=metrics_spec,
                               config_extra=config_extra, experiment_id=experiment_id, tag=tag,
-                              stream=stream, log=log)
+                              artifacts=artifacts, stream=stream, log=log)
     finally:
         if teardown != "keep":
             ctx.finish_instance(uuid, teardown, log=log)

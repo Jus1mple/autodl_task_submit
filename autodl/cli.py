@@ -347,11 +347,12 @@ def cmd_run(ctx, args):
                 logf("环境安装完成")
         instance = uuid0
 
+    artifacts = {"patterns": args.pull, "local_dir": args.pull_to} if args.pull else None
     teardown = "release" if args.release else ("power_off" if args.down else "keep")
     res = tasks.submit(
         ctx, mode=mode, value=value, instance=instance,
         select_region=args.select_region, background=args.background,
-        teardown=teardown, run_id=args.name,
+        teardown=teardown, run_id=args.name, artifacts=artifacts,
         stream=None if (args.json or args.background) else _print_chunk,
         log=logf, check_balance_first=not (args.sync or args.setup),
     )
@@ -363,14 +364,21 @@ def cmd_run(ctx, args):
             print(f"后台任务已启动: run_id={res['run_id']} pid={res['pid']}")
             print(f"  日志: {res['log']}")
             print(f"  查看进度: autodl logs --run-id {res['run_id']}")
+            if artifacts:
+                print(f"  完成后自动拉回 {args.pull} -> {args.pull_to}（logs 时触发）")
         # 后台模式下不在这里关机（任务还在跑）；完成后由用户决定 down
         return EXIT_OK
     if args.json:
         payload = {k: res[k] for k in ("run_id", "exit_code", "stdout", "stderr", "instance")}
         payload["metrics"] = ctx.reg.get_metrics(res["run_id"])
+        payload["artifacts"] = res.get("artifacts")
         print(json.dumps(payload, ensure_ascii=False))
-    elif res["exit_code"] != 0:
-        print(f"[远程退出码] {res['exit_code']}")
+    else:
+        if res.get("artifacts"):
+            a = res["artifacts"]
+            print(f"产物已拉回 {len(a['files'])} 项 -> {a['local_dir']}")
+        if res["exit_code"] != 0:
+            print(f"[远程退出码] {res['exit_code']}")
     return EXIT_OK if res["exit_code"] == 0 else EXIT_TASK
 
 
@@ -394,13 +402,17 @@ def cmd_logs(ctx, args):
     if args.json:
         print(json.dumps({"run_id": run["run_id"], "status": cur["status"],
                           "exit_code": cur.get("exit_code"), "instance": cur.get("instance_uuid"),
-                          "log": info["log"], "note": info["note"], "metrics": m},
+                          "log": info["log"], "note": info["note"], "metrics": m,
+                          "artifacts": info.get("artifacts")},
                          ensure_ascii=False))
         return EXIT_OK
     if info["log"]:
         print(info["log"])
     if info["note"]:
         print(f"({info['note']})")
+    if info.get("artifacts"):
+        a = info["artifacts"]
+        print(f"产物已拉回 {len(a['files'])} 项 -> {a['local_dir']}")
     line = f"--- 状态: {cur['status']}"
     if cur.get("exit_code") is not None:
         line += f" 退出码={cur['exit_code']}"
@@ -506,17 +518,22 @@ def cmd_batch(ctx, args):
     jobs = []
     for j in spec:
         jid = str(j["id"])
+        # 每个 job 可声明 pull（结果文件 glob）；逗号分隔或列表。拉回 <--pull-to>/<job_id>/
+        pull = j.get("pull") or args.pull
+        if isinstance(pull, list):
+            pull = ",".join(str(x) for x in pull)
+        base = {"id": jid, "pull": pull, "pull_to": args.pull_to}
         if j.get("remote_script"):
-            jobs.append({"id": jid, "mode": "remote_script", "value": j["remote_script"]})
+            jobs.append({**base, "mode": "remote_script", "value": j["remote_script"]})
         elif j.get("remote"):
-            jobs.append({"id": jid, "mode": "remote", "value": j["remote"]})
+            jobs.append({**base, "mode": "remote", "value": j["remote"]})
         elif j.get("script"):
             try:
                 text = Path(j["script"]).expanduser().read_text(encoding="utf-8")
             except OSError as e:
                 print(f"job {jid} 脚本读取失败: {e}", file=sys.stderr)
                 return EXIT_USAGE
-            jobs.append({"id": jid, "mode": "script_text", "value": text, "display": j["script"]})
+            jobs.append({**base, "mode": "script_text", "value": text, "display": j["script"]})
         else:
             print(f"job {jid} 缺少 remote_script/remote/script 之一", file=sys.stderr)
             return EXIT_USAGE
@@ -588,6 +605,9 @@ def build_parser():
                     help="--sync 的脏工作区策略（默认 ff：脏则拒绝）")
     sp.add_argument("--setup", action="store_true",
                     help="运行前先按仓库依赖准备环境（hash 幂等，依赖没变则秒跳）")
+    sp.add_argument("--pull", help="结果文件 glob（逗号分隔，相对数据盘），任务完成自动拉回本地。"
+                                   "如 'output/checkpoint-*/adapter*.safetensors,metrics.json'")
+    sp.add_argument("--pull-to", default="./results", help="产物拉回到的本地目录（默认 ./results）")
     sp = add("clone", help="在实例上克隆项目仓库（幂等；已有则 fetch）")
     sp.add_argument("--repo", help="仓库 URL（默认 autodl.yaml 的 git.repo）")
     sp.add_argument("--branch", help="分支（默认 git.branch）")
@@ -638,6 +658,9 @@ def build_parser():
     sp.add_argument("--no-resume", action="store_true", help="不跳过已成功的任务")
     sp.add_argument("--retries", type=int, default=0, help="单任务失败重试次数")
     sp.add_argument("--batch-id", help="批次 id（默认用清单文件名，用于 resume）")
+    sp.add_argument("--pull", help="结果文件 glob（jobs.yaml 里每个 job 也可各自写 pull:）；"
+                                   "每个任务完成拉回 <--pull-to>/<job_id>/")
+    sp.add_argument("--pull-to", default="./results", help="产物拉回的本地根目录（默认 ./results）")
     sp = add("push", help="rsync 同步本地到实例")
     sp.add_argument("local", help="本地目录/文件")
     sp.add_argument("subdir", nargs="?", help="远端子目录（默认 code）")

@@ -113,6 +113,7 @@ info = tasks.refresh_run(ctx, run)         # 探活/tail/完成登记/抓指标
 - `--script <本地路径>`：上传本地 bash 脚本再执行
 - `--down` 跑完关机（保留磁盘环境，下次自动开机复用）；`--release` 彻底释放；`--background` 后台脱机（不能与 `--down/--release` 同用，跑完自行 `autodl down`）
 - 前台/后台运行都记入台账、自动抓指标；`run_id` 自动生成唯一 id（`--name` 可指定）
+- `--pull '<glob>' --pull-to <目录>`：**任务完成自动把结果文件拉回本地**（与自动抓指标同一时机）。glob 逗号分隔、相对数据盘、保留相对结构，如 `--pull 'output/checkpoint-*/adapter*.safetensors,metrics.json' --pull-to ./results`。后台任务在 `autodl logs` 检测到完成时拉回。只改本地、不动实例。
 
 ## 远程 git 工作流：改代码 → push → 实例更新 → 重跑
 
@@ -181,6 +182,7 @@ autodl run --sync ...   # 一条龙：更新代码+重放patch → 跑
 ```yaml
 - id: lr_1e-3
   remote_script: ~/proj/run.sh        # 跑实例上已有脚本（可在脚本里读环境变量区分配置）
+  pull: 'metrics.json,output/*.pt'    # 该任务完成后拉回的结果文件（拉到 <--pull-to>/lr_1e-3/）
 - id: lr_1e-4
   remote: "cd ~/proj && LR=1e-4 bash run.sh"
 - id: baseline
@@ -188,9 +190,10 @@ autodl run --sync ...   # 一条龙：更新代码+重放patch → 跑
 ```
 
 ```bash
-autodl batch --file jobs.yaml --max-parallel 3 --on-finish release
+autodl batch --file jobs.yaml --max-parallel 3 --on-finish release --pull-to ./results
 ```
 - 至多 `--max-parallel` 台实例并行，一台跑完自动取下一个任务（实例复用）。
+- **每个任务完成后自动拉回各自的结果文件**到 `<--pull-to>/<job_id>/`（job 里写 `pull:`，或用命令行 `--pull` 给所有 job 统一 glob）——多任务的产物互不覆盖。
 - 结果记入 `.autodl/registry.db`；中断后重跑会 **resume**（跳过已成功的任务）。
 - `--on-finish release|power_off|keep` 控制收尾；`--retries N` 单任务失败重试；`--select-region` 按库存选区。
 

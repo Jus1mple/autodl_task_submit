@@ -16,6 +16,7 @@ import posixpath
 import re
 import socket
 import subprocess
+import tempfile
 import time
 from pathlib import Path
 
@@ -24,6 +25,8 @@ import paramiko
 from .errors import SSHUnavailable
 
 _RUN_ID_RE = re.compile(r"[A-Za-z0-9_.\-]+")
+# 产物 glob 会拼进远端 shell 做 glob 展开，只允许安全字符，防注入
+_ARTIFACT_PAT_RE = re.compile(r"^[\w./*?\[\]-]+$")
 
 
 def _safe_run_id(run_id: str) -> str:
@@ -361,6 +364,47 @@ class SSHManager:
         remote = f"{self.cfg.user}@{host}:{self.cfg.remote_workdir}/{remote_subpath}"
         Path(local_path).mkdir(parents=True, exist_ok=True)
         return self._rsync(snapshot, remote, local_path.rstrip("/") + "/", key_path, [], instance_uuid)
+
+    def pull_artifacts(self, snapshot, patterns, local_dir, key_path, base=None, instance_uuid=None):
+        """按 glob 拉回结果文件：从远端 base（默认数据盘）拉回匹配 patterns 的文件/目录到
+        local_dir，保留相对结构。patterns 可为逗号分隔字符串或列表，每项是相对 base 的
+        glob（如 'output/checkpoint-*/adapter_model.safetensors,metrics.json'）。
+        返回 {files, local_dir, skipped_patterns}。需要密钥免密。"""
+        if not key_path:
+            raise SSHUnavailable(SSHUnavailable.AUTH_FAILED, "拉产物需要密钥免密：先 ensure_key_access")
+        base = (base or self.cfg.remote_workdir).rstrip("/")
+        raw = patterns.split(",") if isinstance(patterns, str) else list(patterns or [])
+        safe, bad = [], []
+        for p in (x.strip() for x in raw if x and x.strip()):
+            (safe if _ARTIFACT_PAT_RE.match(p) else bad).append(p)
+        if not safe:
+            return {"files": [], "local_dir": local_dir, "skipped_patterns": bad}
+        if not self.ensure_rsync(snapshot, instance_uuid):
+            raise SSHUnavailable(SSHUnavailable.UNKNOWN, "远端无 rsync 且自动安装失败")
+        # 远端展开 glob（patterns 已校验只含安全字符，故可不加引号让 shell 展开）
+        expand = (f"cd {_shq(base)} 2>/dev/null || exit 0\n"
+                  f"for p in {' '.join(safe)}; do ls -d $p 2>/dev/null; done")
+        out, _e, _c = self.run(snapshot, expand, instance_uuid)
+        files = sorted({l.strip().lstrip("./") for l in out.splitlines() if l.strip()})
+        if not files:
+            return {"files": [], "local_dir": local_dir, "skipped_patterns": bad}
+        Path(local_dir).mkdir(parents=True, exist_ok=True)
+        host, port = snapshot["proxy_host"], snapshot["ssh_port"]
+        ssh_cmd = (f"ssh -p {port} -i {key_path} -o StrictHostKeyChecking=accept-new "
+                   f"-o IdentitiesOnly=yes")
+        with tempfile.NamedTemporaryFile("w", delete=False) as tf:
+            tf.write("\n".join(files) + "\n")
+            listpath = tf.name
+        try:
+            # --files-from：从 base 拉列表里的相对路径，保留结构（-a 含 -r，目录会递归）
+            cmd = ["rsync", "-az", f"--files-from={listpath}", "-e", ssh_cmd,
+                   f"{self.cfg.user}@{host}:{base}/", local_dir.rstrip("/") + "/"]
+            proc = subprocess.run(cmd, capture_output=True, text=True)
+            if proc.returncode != 0:
+                raise SSHUnavailable(SSHUnavailable.UNKNOWN, f"拉产物 rsync 失败: {proc.stderr[:300]}")
+        finally:
+            os.unlink(listpath)
+        return {"files": files, "local_dir": local_dir, "skipped_patterns": bad}
 
 
 # ---------------- 小工具 ----------------
