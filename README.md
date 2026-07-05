@@ -6,10 +6,17 @@ AutoDL GPU 云的 **Python 库 + 命令行工具**：开机/复用实例、传�
 
 > 可视化大盘（FastAPI + 网页）**不在核心包里**，在 [`web-dashboard`](../../tree/web-dashboard) 分支单独维护——核心包保持零 web 依赖（只有 requests / paramiko / pyyaml / dotenv）。
 
+> 📖 完整参考手册见 [USAGE.md](USAGE.md)：安装、全部配置字段、命令参考、工作流、`--json` 契约、Python API、故障排查。
+
 ## 安装与配置
 
+用 [uv](https://docs.astral.sh/uv/)（仓库私有，git 安装走 ssh 形式）：
+
 ```bash
-pip install git+https://github.com/Jus1mple/autodl_task_submit.git   # 或克隆后 uv sync
+uv tool install git+ssh://git@github.com/Jus1mple/autodl_task_submit.git   # 全局 autodl 命令
+# 或项目内当库用: uv add git+ssh://git@github.com/Jus1mple/autodl_task_submit.git
+# 或本地开发:     git clone ... && uv sync && uv run pytest   # 4 套测试，不触网，~8s
+
 echo 'AUTODL_TOKEN=你的Token' > .env  # Token 只放环境变量/.env，不进 yaml（已被 .gitignore）
 cp autodl.example.yaml autodl.yaml    # 可选：改实例规格/区域/预算/SSH/git 仓库
 ```
