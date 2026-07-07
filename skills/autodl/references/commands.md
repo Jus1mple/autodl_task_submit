@@ -1,0 +1,105 @@
+# autodl 命令与配置参考（浓缩版）
+
+完整手册在仓库 `USAGE.md`；此处为高频速查。
+
+## 命令总表
+
+通用参数放子命令后：`--config` `--dry-run` `--yes/-y` `--json`
+
+| 命令 | 作用 | 关键参数 |
+|---|---|---|
+| `balance` | 余额 | |
+| `stock` | GPU 库存（区域×型号 空闲/总数）| `--region` |
+| `status` / `ls` | 实例列表+计费分类，`*`=活动实例 | |
+| `runs` | 本地台账运行记录（含指标，不触网）| `--limit N` |
+| `up` | 复用/新建实例+SSH免密+打印直连信息 | `--select-region` |
+| `use <uuid>` | 登记已有实例为活动实例（不创建）| |
+| `down` | 关机活动实例 | `--release`(彻底释放,慎) |
+| `stop-all` | 止损：关停所有 running | `--release` |
+| `run` | 执行任务 | 见下 |
+| `logs` | tail 日志+状态+指标；完成时自动对账 | `--run-id` `--lines` `-f/--follow` |
+| `clone` | 实例上克隆仓库（幂等+patch）| `--repo` `--branch` `--dir` |
+| `sync` | 仓库更新到 remote（+重放 patch）| `--mode ff\|stash\|reset` |
+| `patch` | 手动重放本地补丁 | `--dir` |
+| `setup` | 按依赖声明装环境（hash 幂等）| `--force` `--background` |
+| `push/pull` | rsync 本地↔实例数据盘 | |
+| `batch` | 多实例并行批量 | `--file` `--max-parallel` `--on-finish` `--retries` `--pull` |
+| `snapshot-env` | 实例→私有镜像（占存储费,无删除API,慎）| `--name` |
+| `idle-guard` | 空闲自动关机看门狗 | `--idle-minutes` `--once` |
+| `balance-watch` | 余额预警/急停 | `--warn` `--stop` |
+
+## run 详解
+
+```
+autodl run (--remote-script 实例上脚本 | --remote "命令" | --script 本地脚本) \
+  [--instance U] [--background] [--name RUN_ID] [--down|--release] \
+  [--sync [--sync-mode ff|stash|reset]] [--setup] \
+  [--pull 'glob1,glob2' --pull-to DIR] [--select-region] [--json]
+```
+
+- 三种执行方式互斥；`--remote-script` 的 `~` 会正确展开。
+- 前台：流式回显，`--down/--release` 结束后收尾（失败也收尾）。
+- 后台：立即返回 run_id；与 `--down/--release` 互斥。
+- `--sync`：先更新仓库（缺则 clone）；`--setup`：先按 hash 装环境；失败即中止不浪费卡时。
+- `--pull`：完成时把 glob 匹配的文件拉回本地（后台任务在 logs 检测到完成时触发）。
+- 每次运行前自动清实例上旧 `metrics.json`，防指标串台。
+
+## autodl.yaml 字段
+
+```yaml
+image_uuid: base-image-12be412037   # 或私有镜像 image-xxxx
+gpu_spec_uuid: v-48g                # v-48g=vGPU-48GB(4090) / 4090D / h800 / 5090-p ...
+cuda_v_from: 111
+instance_name: task-runner
+expand_disk_gb: 10
+req_gpu_amount: 1                   # 1-4
+regions: [westDC2, westDC3, beijingDC1]
+gpu_stock_name: vGPU-48GB
+min_balance_yuan: 10.0              # 余额护栏
+registry_path: .autodl/registry.db
+ssh:
+  remote_workdir: /root/autodl-tmp  # 数据盘约定根
+git:
+  repo: ""                          # https/ssh；私有https配 AUTODL_GIT_TOKEN
+  branch: main
+  dir: ""                           # 默认 <workdir>/repo
+  depth: 1                          # 浅克隆
+  turbo: true                       # clone/fetch 走学术加速
+  patches: ""                       # 本地补丁目录, clone/sync 自动 git apply
+env:
+  setup: ""                         # 自定义安装命令(最高优先)
+  auto: true                        # 探测 setup.sh>environment.yml>requirements.txt>pyproject
+  pip_index: https://pypi.tuna.tsinghua.edu.cn/simple
+  academic_turbo: false
+```
+
+Token 优先级：项目目录(及父目录) `.env` > autodl.yaml 旁 `.env` > 环境变量 > `~/.autodl/.env`。
+
+## metrics.json 规范
+
+任务写到 `<数据盘>/metrics.json`，完成自动入库：
+
+```json
+{"final_acc": 0.99,
+ "series": [{"step": 1, "loss": 0.5}, {"step": 2, "loss": 0.4}]}
+```
+
+顶层标量=最终指标；`series`=趋势曲线。日志正则抓取（`ASR: 0.75` 这类行）通过 Python API 的 `metrics_spec` 声明。
+
+## Python API
+
+```python
+from autodl import connect, submit
+ctx = connect()                       # 读 autodl.yaml + .env
+res = submit(ctx, mode="remote_script",  # remote_script|remote|script|script_text
+             value="~/proj/run.sh", teardown="power_off",   # keep|power_off|release
+             background=False,
+             artifacts={"patterns": "output/*", "local_dir": "./results"},
+             stream=lambda s: print(s, end=""))
+ctx.reg.get_metrics(res["run_id"]); ctx.reg.get_metric_series(res["run_id"])
+
+from autodl import tasks
+tasks.refresh_run(ctx, ctx.reg.get_run(rid))   # 探活/对账/抓指标/拉产物
+```
+
+底层：`ctx.api`(HTTP) `ctx.ssh`(SSH) `ctx.reg`(台账) `ctx.ensure_instance/ensure_specific/finish_instance`，`autodl.gitsync`、`autodl.envsetup`。

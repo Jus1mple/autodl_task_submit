@@ -310,6 +310,21 @@ def cmd_run(ctx, args):
         print("--background 与 --down/--release 不能同时用（后台任务结束时机未知）；"
               "请任务完成后自行 `autodl down`。", file=sys.stderr)
         return EXIT_USAGE
+    if args.dry_run:
+        # 预览而不执行：run 会开机（花钱）+ 跑任务，dry-run 必须在任何 API 调用之前拦下
+        target = args.instance or ctx.reg.get_active() or "(无活动实例→将新建，产生新计费)"
+        preview = tasks.build_command(mode, value) or f"(上传并执行 {value})"
+        teardown = "release" if args.release else ("power_off" if args.down else "keep")
+        print(f"[dry-run] 实例: {target}（关机则自动开机）")
+        if args.sync:
+            print(f"[dry-run] 先 sync 仓库（mode={args.sync_mode}）" + ("，再 setup 环境" if args.setup else ""))
+        elif args.setup:
+            print("[dry-run] 先 setup 环境（hash 幂等）")
+        print(f"[dry-run] 执行: {preview}" + ("  [后台]" if args.background else ""))
+        if args.pull:
+            print(f"[dry-run] 完成后拉回 {args.pull} -> {args.pull_to}")
+        print(f"[dry-run] 收尾: {teardown}。未执行任何操作。")
+        return EXIT_OK
     if args.instance:
         ctx.use_instance(args.instance, log=None)  # 顺手登记为活动实例，之后 logs/down 默认用它
     logf = _eprint if args.json else print
