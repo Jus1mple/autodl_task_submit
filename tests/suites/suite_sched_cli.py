@@ -152,7 +152,7 @@ class CliCtx:
 def mkargs(**kw):
     base = dict(script=None, remote_script=None, remote=None, instance=None, background=False,
                 name=None, select_region=False, down=False, release=False, json=False,
-                sync=False, sync_mode="ff", setup=False, pull=None, pull_to="./results")
+                sync=False, sync_mode="ff", setup=False, pull=None, pull_to="./results", dry_run=False)
     base.update(kw)
     return types.SimpleNamespace(**base)
 
