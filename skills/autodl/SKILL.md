@@ -45,5 +45,6 @@ autodl runs --json          # run_id/状态/指标；曲线用 Python: ctx.reg.g
 - `--background` 与 `--down/--release` **互斥**（后台结束时机未知），跑完自行 down。
 - **指标约定**：任务把结果写实例的 `~/autodl-tmp/metrics.json`（顶层标量+可选 `series` 曲线），完成自动入本地台账；关机后台账数据仍在。指标为空先 `logs` 一次（会自动补抓），别急着断定丢了。
 - 跑**别人的仓库**要适配时：补丁放本地 `patches/*.patch`（git diff 生成）配 `git.patches:`，clone/sync 自动应用、绝不 push 上游。范例：仓库 `examples/vlm-r1-refcoco/`。
+- `run --instance X` 会**顺手把 X 登记为活动实例**——探查完不属于你管的机器后，记得 `autodl use <原实例>` 切回，否则之后的裸 `down` 会关错机器。
 - 实例系统盘只有 30G（HF 缓存大户）：大任务前 `run --remote 'df -h /'` 看一眼。
 - **训练类任务先测 baseline 再训**：base 完全不会→RL 冷启动训不动；训练 reward 刷满≠有效，必须 held-out 对比 base。细节见 troubleshooting。
