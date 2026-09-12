@@ -206,10 +206,11 @@ class SSHManager:
 
     # ---------------- 后台非阻塞执行 ----------------
     def run_script(self, snapshot, script_text, run_id, instance_uuid=None, prelude="",
-                   stream=None, max_capture=None):
+                   stream=None, max_capture=None, runner="bash"):
         """上传一段脚本到数据盘并**同步**执行，返回 (stdout, stderr, exit_code)。
         prelude: 在脚本前于同一 shell 里执行的命令（如清理旧 metrics.json），以 ';' 结尾。
-        max_capture: 见 run()——限制累积到内存的输出量，防大输出 OOM。"""
+        max_capture: 见 run()——限制累积到内存的输出量，防大输出 OOM。
+        runner: 执行器，默认 bash；任务时限时为 'timeout -k 60 N bash'。"""
         run_id = _safe_run_id(run_id)
         wd = self.cfg.remote_workdir
         task = f"{wd}/task_{run_id}.sh"
@@ -221,7 +222,7 @@ class SSHManager:
             with sftp.open(task, "w") as f:
                 f.write(script_text)
             sftp.close(); sftp = None
-            return _exec(client, f"{prelude}bash {task}", stream, max_capture)
+            return _exec(client, f"{prelude}{runner} {task}", stream, max_capture)
         finally:
             if sftp:
                 sftp.close()
@@ -260,7 +261,8 @@ class SSHManager:
             client.close()
         return {"pid": pid, "log": log_file, "exit_file": exit_file, "workdir": wd}
 
-    def run_background(self, snapshot, script_text, run_id, instance_uuid=None, prelude=""):
+    def run_background(self, snapshot, script_text, run_id, instance_uuid=None, prelude="",
+                       runner="bash"):
         """上传一段脚本到数据盘并后台执行。返回 {pid, log, exit_file, workdir}。"""
         run_id = _safe_run_id(run_id)
         wd = self.cfg.remote_workdir
@@ -277,7 +279,7 @@ class SSHManager:
             if sftp:
                 sftp.close()
             client.close()
-        return self.run_background_command(snapshot, f"cd {_shq(wd)} && bash {_shq(task_file)}",
+        return self.run_background_command(snapshot, f"cd {_shq(wd)} && {runner} {_shq(task_file)}",
                                            run_id, instance_uuid, prelude=prelude)
 
     def poll(self, snapshot, run_meta, instance_uuid=None):
@@ -304,6 +306,21 @@ class SSHManager:
         if len(parts) >= 2 and parts[1].lstrip("-").isdigit():
             code = int(parts[1])
         return "done", code
+
+    def kill_background(self, snapshot, run_meta, instance_uuid=None, grace=5):
+        """终止后台任务：pid 是 setsid 会话首进程，kill 整个进程组（含子进程）。
+        先 TERM、等 grace 秒、再 KILL；exit_file 不存在则写 137，让 poll 判定为完成。
+        返回 True=发出了 kill；pid 不可用时只写 exit_file 返回 False。"""
+        pid = (run_meta.get("pid") or "").strip()
+        exit_file = run_meta["exit_file"]
+        if pid.isdigit():
+            cmd = (f"kill -TERM -- -{pid} 2>/dev/null; sleep {int(grace)}; "
+                   f"kill -KILL -- -{pid} 2>/dev/null; "
+                   f"[ -f {_shq(exit_file)} ] || echo 137 > {_shq(exit_file)}; echo KILLED")
+        else:
+            cmd = f"[ -f {_shq(exit_file)} ] || echo 137 > {_shq(exit_file)}; echo NOPID"
+        so, _se, _c = self.run(snapshot, cmd, instance_uuid)
+        return "KILLED" in so
 
     def tail(self, snapshot, log_file, lines=50, instance_uuid=None):
         so, _se, _c = self.run(snapshot, f"tail -n {int(lines)} {_shq(log_file)} 2>/dev/null", instance_uuid)

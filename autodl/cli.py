@@ -11,13 +11,16 @@
   clone / sync         在实例上克隆项目仓库 / 从 remote 更新（配合本地改码后 git push）
   setup [--force]      按仓库依赖声明准备环境（hash 幂等，未变秒跳）
   logs [--run-id R]    查看后台任务日志 + 退出码 + 指标
+  kill [--run-id R]    终止后台任务（kill 进程组）
   runs [--limit N]     列出台账里的运行记录（含指标）
+  cost [--since 7d]    我的花费报表（共享账号下只算我开机的时段）
+  budget-guard         个人预算/会话时长守护（只关我的实例）
   push LOCAL [SUB]     rsync 同步本地目录到实例数据盘
   pull SUB [LOCAL]     rsync 从实例拉回产物
 
 全局：--config 指定配置文件；--dry-run 仅预览破坏性动作；--yes 跳过确认；--json 机器可读。
 --json 时 stdout 只输出 JSON（进度日志走 stderr），可以直接 `| jq` / 被脚本消费。
-退出码：0 成功；2 用法错误；3 余额不足；4 无库存；5 SSH 不可达；6 任务非零退出；1 其它。
+退出码：0 成功；2 用法错误；3 余额不足；4 无库存；5 SSH 不可达；6 任务非零退出；7 个人预算触顶；1 其它。
 """
 from __future__ import annotations
 
@@ -28,12 +31,16 @@ from pathlib import Path
 
 import yaml
 
-from . import __version__, envsetup, gitsync, monitor, scheduler, tasks
+import time
+
+from . import __version__, cost, envsetup, gitsync, monitor, scheduler, tasks
 from .config import load_config, require_token
 from .core import Context, billing_class
-from .errors import APIError, AutoDLError, ConfigError, InsufficientBalance, SSHUnavailable
+from .errors import (APIError, AutoDLError, BudgetExceeded, ConfigError, InsufficientBalance,
+                     SSHUnavailable)
 
 EXIT_OK, EXIT_USAGE, EXIT_BALANCE, EXIT_STOCK, EXIT_SSH, EXIT_TASK, EXIT_ERR = 0, 2, 3, 4, 5, 6, 1
+EXIT_BUDGET = 7
 
 
 def _confirm(prompt, assume_yes):
@@ -86,8 +93,21 @@ def cmd_stock(ctx, args):
     return EXIT_OK
 
 
+def _usage_line(u, b):
+    """一行"我的"用量摘要（status / budget-guard 共用）。"""
+    def cap(v, c):
+        return f"¥{v:.2f}" + (f"/{c:.0f}" if c else "")
+    return (f"我的花费: 今日 {cap(u['today'], b.daily_yuan)}  本周 {cap(u['week'], b.weekly_yuan)}  "
+            f"本月 {cap(u['month'], b.monthly_yuan)}（+磁盘≈¥{u['disk_month']:.2f}）  "
+            f"running {u['running']} 台  ¥{u['burn_rate']:.2f}/h")
+
+
 def cmd_status(ctx, args):
     instances = ctx.api.list_instances()
+    try:
+        cost.reconcile(ctx, items=instances)   # 顺手对账：别人开/关了我的机也能追平
+    except AutoDLError:
+        pass
     active = ctx.reg.get_active()
     rows = []
     for it in instances:
@@ -95,40 +115,55 @@ def cmd_status(ctx, args):
         st = it.get("status")
         rows.append({
             "instance_uuid": uid,
+            "name": it.get("name") or "",
             "status": st,
             "billing": billing_class(st),
             "region": it.get("region_sign"),
             "active": uid == active,
+            "mine": cost.is_mine(ctx, it),
         })
+    u = cost.usage(ctx)
     if args.json:
-        print(json.dumps({"balance_yuan": round(ctx.api.balance_yuan(), 2), "instances": rows},
+        print(json.dumps({"balance_yuan": round(ctx.api.balance_yuan(), 2), "instances": rows,
+                          "usage": {k: (round(v, 4) if isinstance(v, float) else v) for k, v in u.items()}},
                          ensure_ascii=False))
         return EXIT_OK
-    print(f"账户余额: ¥{ctx.api.balance_yuan():.2f}    实例数: {len(rows)}")
-    for r in rows:
+    mine = [r for r in rows if r["mine"]]
+    print(f"账户余额: ¥{ctx.api.balance_yuan():.2f}（共享）    实例数: {len(rows)}，我的: {len(mine)}")
+    print(_usage_line(u, ctx.cfg.budget))
+    show = rows if getattr(args, "all", False) else mine
+    for r in show:
         mark = " *" if r["active"] else "  "
-        print(f"{mark} {r['instance_uuid']}  {r['status']:<14} [{r['billing']}]  {r['region'] or ''}")
-    if not rows:
-        print("  (无实例)")
+        who = "我" if r["mine"] else "他"
+        print(f"{mark} {r['instance_uuid']}  {r['status']:<14} [{r['billing']}] {who}  {r['region'] or ''}  {r['name']}")
+    if not show:
+        print("  (无实例)" if not rows else f"  (我的实例为空；--all 查看全部 {len(rows)} 台)")
+    elif not getattr(args, "all", False) and len(rows) > len(mine):
+        print(f"  … 另有 {len(rows) - len(mine)} 台别人的实例（--all 查看）")
     return EXIT_OK
 
 
 def cmd_stop_all(ctx, args):
-    running = [(it.get("instance_uuid") or it.get("uuid"))
-               for it in ctx.api.list_instances() if it.get("status") == "running"]
-    running = [u for u in running if u]
+    scope = "all" if getattr(args, "all", False) else "mine"
+    items, others = ctx.running_instances(scope)
+    running = [it.get("uuid") or it.get("instance_uuid") for it in items]
     if not running:
-        print("没有 running 实例。")
+        print("没有我的 running 实例。" + (f"（另有 {len(others)} 台别人的，--all 才会碰）" if others else ""))
         return EXIT_OK
-    print(f"将关停 {len(running)} 台 running 实例: {', '.join(running)}"
+    who = "账号里全部" if scope == "all" else "我的"
+    print(f"将关停{who} {len(running)} 台 running 实例: {', '.join(running)}"
           + ("（并释放）" if args.release else ""))
+    if others:
+        print(f"  跳过 {len(others)} 台别人的实例（--all 才会碰）")
     if args.dry_run:
         print("[dry-run] 未执行。")
         return EXIT_OK
+    if scope == "all" and not args.yes:
+        print("⚠️ --all 会关停共享账号里所有人的实例！")
     if not _confirm("确认止损？", args.yes):
         print("已取消。")
         return EXIT_OK
-    ctx.stop_all_running(release=args.release)
+    ctx.stop_all_running(release=args.release, scope=scope)
     return EXIT_OK
 
 
@@ -321,6 +356,9 @@ def cmd_run(ctx, args):
         elif args.setup:
             print("[dry-run] 先 setup 环境（hash 幂等）")
         print(f"[dry-run] 执行: {preview}" + ("  [后台]" if args.background else ""))
+        mh = tasks.effective_max_hours(ctx, getattr(args, "max_hours", None))
+        if mh:
+            print(f"[dry-run] 时限: {mh:g}h（实例侧 timeout，超时 exit=124）")
         if args.pull:
             print(f"[dry-run] 完成后拉回 {args.pull} -> {args.pull_to}")
         print(f"[dry-run] 收尾: {teardown}。未执行任何操作。")
@@ -368,6 +406,7 @@ def cmd_run(ctx, args):
         ctx, mode=mode, value=value, instance=instance,
         select_region=args.select_region, background=args.background,
         teardown=teardown, run_id=args.name, artifacts=artifacts,
+        max_hours=getattr(args, "max_hours", None),
         stream=None if (args.json or args.background) else _print_chunk,
         log=logf, check_balance_first=not (args.sync or args.setup),
     )
@@ -474,6 +513,86 @@ def cmd_logs(ctx, args):
     print(line + " ---")
     if m:
         print("指标: " + json.dumps(m, ensure_ascii=False))
+    return EXIT_OK
+
+
+def cmd_kill(ctx, args):
+    """终止后台任务（默认最近一个 running 的）。"""
+    if args.run_id:
+        run = ctx.reg.get_run(args.run_id)
+        if not run:
+            print(f"未找到 run: {args.run_id}", file=sys.stderr)
+            return EXIT_USAGE
+    else:
+        runs = [r for r in ctx.reg.list_runs() if r.get("status") == "running" and r.get("exit_file")]
+        if not runs:
+            print("没有 running 的后台任务。", file=sys.stderr)
+            return EXIT_OK
+        run = runs[-1]
+    print(f"将终止 {run['run_id']}（实例 {run.get('instance_uuid')}）", file=sys.stderr if args.json else sys.stdout)
+    if args.dry_run:
+        print("[dry-run] 未执行。")
+        return EXIT_OK
+    if not args.json and not _confirm("确认终止？", args.yes):
+        print("已取消。")
+        return EXIT_OK
+    res = tasks.kill_run(ctx, run, log=None if args.json else print)
+    if args.json:
+        print(json.dumps(res, ensure_ascii=False))
+    else:
+        print(res["note"])
+    return EXIT_OK if res["killed"] or res["state"] != "running" else EXIT_ERR
+
+
+def cmd_cost(ctx, args):
+    """我的花费报表：只统计我开机的时段 × 该实例小时价（+ 磁盘费估算）。"""
+    since = cost.parse_since(args.since)
+    if not getattr(args, "offline", False):
+        try:
+            cost.reconcile(ctx, log=_eprint if args.json else print)
+        except AutoDLError as e:
+            _eprint(f"对账失败（{e}），按本地账本统计")
+    by = args.by
+    if by == "run":
+        rows = [r for r in cost.run_costs(ctx, ctx.reg.list_runs()) if (r.get("started_at") or 0) >= since]
+        rows.sort(key=lambda r: r.get("started_at") or 0, reverse=True)
+        rep = {"rows": [{"run_id": r["run_id"], "status": r["status"], "instance": r.get("instance_uuid"),
+                         "hours": r["hours"], "price": r["price"], "cost": r["cost_yuan"],
+                         "started_at": r.get("started_at")} for r in rows],
+               "total": sum(r["cost_yuan"] or 0 for r in rows), "disk": 0.0, "since": since,
+               "until": time.time()}
+    else:
+        rep = cost.report(ctx, since, by=by)
+    u = cost.usage(ctx)
+    if args.json:
+        rep["usage"] = u
+        print(json.dumps(rep, ensure_ascii=False, default=float))
+        return EXIT_OK
+    label = {"day": "日期", "instance": "实例", "session": "会话", "run": "run"}[by]
+    print(f"自 {time.strftime('%Y-%m-%d %H:%M', time.localtime(since))} 起，按{label}：")
+    for r in rep["rows"]:
+        if by == "day":
+            print(f"  {r['day']}  {r['hours']:6.2f}h  ¥{r['cost']:8.2f}")
+        elif by == "instance":
+            print(f"  {r['instance_uuid']:<18} {r['hours']:6.2f}h  ¥{r['cost']:8.2f}  {r['sessions']} 段  {r.get('gpu_spec') or ''}")
+        elif by == "session":
+            st = time.strftime("%m-%d %H:%M", time.localtime(r["started_at"]))
+            en = time.strftime("%m-%d %H:%M", time.localtime(r["ended_at"])) if r["ended_at"] else "running"
+            print(f"  {r['instance_uuid']:<18} {st} → {en:<12} {r['hours']:6.2f}h × ¥{r['price']:.2f} = ¥{r['cost']:.2f}  [{r['source']}] {r.get('project') or ''}")
+        else:
+            c = f"¥{r['cost']:.2f}" if r["cost"] is not None else "?"
+            h = f"{r['hours']:.2f}h" if r["hours"] is not None else "-"
+            print(f"  {r['run_id']:<40} {r['status']:<10} {h:>8}  {c:>9}")
+    if not rep["rows"]:
+        print("  (无记录)")
+    print(f"合计 ¥{rep['total']:.2f}" + (f"，磁盘费估算 ¥{rep['disk']:.2f}" if rep.get("disk") else ""))
+    print(_usage_line(u, ctx.cfg.budget))
+    return EXIT_OK
+
+
+def cmd_budget_guard(ctx, args):
+    res = monitor.budget_guard(ctx, interval=args.interval, once=args.once)
+    print(f"budget-guard 结束: {res}")
     return EXIT_OK
 
 
@@ -633,10 +752,12 @@ def build_parser():
     add("balance", help="查余额")
     sp = add("stock", help="查 GPU 库存")
     sp.add_argument("--region", help="只查指定区域")
-    add("status", help="列出实例 + 计费分类")
-    add("ls", help="status 的别名")
-    sp = add("stop-all", help="一键止损：关停所有 running 实例")
+    for nm in ("status", "ls"):
+        sp = add(nm, help="列出我的实例 + 计费分类 + 我的花费（--all 看全账号）")
+        sp.add_argument("--all", action="store_true", help="显示共享账号里所有人的实例")
+    sp = add("stop-all", help="一键止损：关停我的 running 实例（--all 才动别人的）")
     sp.add_argument("--release", action="store_true", help="同时释放（彻底停止磁盘计费）")
+    sp.add_argument("--all", action="store_true", help="关停共享账号里所有人的实例（慎！）")
     sp = add("up", help="拉起/复用实例并打印直连信息")
     sp.add_argument("--select-region", action="store_true", help="按库存自动选区创建")
     sp = add("down", help="关机当前活动实例")
@@ -663,6 +784,8 @@ def build_parser():
     sp.add_argument("--pull", help="结果文件 glob（逗号分隔，相对数据盘），任务完成自动拉回本地。"
                                    "如 'output/checkpoint-*/adapter*.safetensors,metrics.json'")
     sp.add_argument("--pull-to", default="./results", help="产物拉回到的本地目录（默认 ./results）")
+    sp.add_argument("--max-hours", type=float, help="任务时限（小时）：实例侧 timeout，到点终止(exit=124)；"
+                                                     "默认 budget.max_run_hours")
     sp = add("clone", help="在实例上克隆项目仓库（幂等；已有则 fetch）")
     sp.add_argument("--repo", help="仓库 URL（默认 autodl.yaml 的 git.repo）")
     sp.add_argument("--branch", help="分支（默认 git.branch）")
@@ -687,8 +810,17 @@ def build_parser():
     sp.add_argument("--lines", type=int, default=50, help="tail 行数")
     sp.add_argument("--follow", "-f", action="store_true",
                     help="实时跟随日志到任务完成（tail -f 式，Ctrl-C 停跟随不停任务）")
+    sp = add("kill", help="终止后台任务（kill 实例上的进程组，登记 exit=137）")
+    sp.add_argument("--run-id", help="指定 run_id（默认最近一个 running 的后台任务）")
     sp = add("runs", help="列出台账里的运行记录（含指标，只查本地不触网）")
     sp.add_argument("--limit", type=int, default=20, help="最多显示条数（0=全部）")
+    sp = add("cost", help="我的花费报表（共享账号下只算我开机的时段）")
+    sp.add_argument("--since", default="month", help="起点：7d / 24h / 2w / today / week / month(默认) / YYYY-MM-DD")
+    sp.add_argument("--by", choices=["day", "instance", "session", "run"], default="day", help="汇总维度")
+    sp.add_argument("--offline", action="store_true", help="不触网对账，只看本地账本")
+    sp = add("budget-guard", help="个人预算/会话时长守护：触顶只关我的实例")
+    sp.add_argument("--interval", type=int, default=300, help="轮询间隔(秒)")
+    sp.add_argument("--once", action="store_true", help="只判一次不动作")
     sp = add("snapshot-env", help="把实例环境存为私有镜像（会持续占存储费）")
     sp.add_argument("--name", required=True, help="镜像名")
     sp.add_argument("--instance", help="目标实例（默认活动实例）")
@@ -705,7 +837,8 @@ def build_parser():
     sp.add_argument("--warn", type=float, required=True, help="预警线(元)")
     sp.add_argument("--stop", type=float, required=True, help="急停线(元)")
     sp.add_argument("--interval", type=int, default=300, help="轮询间隔(秒)")
-    sp.add_argument("--stop-mode", choices=["stop_all", "active"], default="stop_all", help="急停范围")
+    sp.add_argument("--stop-mode", choices=["mine", "active", "stop_all"], default="mine",
+                    help="急停范围：mine=只关我的(默认) / active=活动实例 / stop_all=全账号(慎)")
     sp.add_argument("--once", action="store_true", help="只查一次")
     sp = add("batch", help="批量并行调度（多实例跑多任务）")
     sp.add_argument("--file", required=True, help="任务清单 YAML（list of {id, remote_script|remote|script}）")
@@ -734,6 +867,7 @@ _DISPATCH = {
     "patch": cmd_patch, "setup": cmd_setup, "push": cmd_push, "pull": cmd_pull,
     "snapshot-env": cmd_snapshot_env, "idle-guard": cmd_idle_guard,
     "balance-watch": cmd_balance_watch, "batch": cmd_batch,
+    "kill": cmd_kill, "cost": cmd_cost, "budget-guard": cmd_budget_guard,
 }
 
 
@@ -750,6 +884,9 @@ def main(argv=None):
     except InsufficientBalance as e:
         print(str(e), file=sys.stderr)
         return EXIT_BALANCE
+    except BudgetExceeded as e:
+        print(f"个人预算: {e}", file=sys.stderr)
+        return EXIT_BUDGET
     except SSHUnavailable as e:
         print(f"SSH 不可达: {e}", file=sys.stderr)
         return EXIT_SSH

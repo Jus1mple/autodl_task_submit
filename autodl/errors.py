@@ -14,6 +14,10 @@ class InsufficientBalance(AutoDLError):
     """余额低于安全阈值，拒绝开机/提交任务。"""
 
 
+class BudgetExceeded(AutoDLError):
+    """个人预算/配额（budget.*）已用尽，拒绝开机/创建/提交。"""
+
+
 class APIError(AutoDLError):
     """AutoDL API 返回 code != Success，或 HTTP 层错误。"""
 

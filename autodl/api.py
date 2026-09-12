@@ -49,6 +49,14 @@ REGIONS = [
 ]
 
 
+def _owned_name(cfg, name):
+    """实例名加 "<owner>/" 前缀：共享账号里一眼看出是谁的，也是对账认领"我的实例"的依据。"""
+    o = (getattr(cfg, "owner", "") or "").strip()
+    if o and not str(name).startswith(o + "/"):
+        return f"{o}/{name}"
+    return name
+
+
 class AutoDLClient:
     def __init__(self, cfg: Config):
         self.cfg = cfg
@@ -129,10 +137,18 @@ class AutoDLClient:
     def balance_yuan(self) -> float:
         return self._post("/api/v1/dev/wallet/balance", idempotent=True)["assets"] / 1000.0
 
-    def list_instances(self) -> list:
-        data = self._post("/api/v1/dev/instance/pro/list",
-                          {"page_index": 1, "page_size": 100}, idempotent=True)
-        return data.get("list", [])
+    def list_instances(self, page_size=100, max_pages=50) -> list:
+        """账号下全部实例（自动翻页）。共享账号里实例可能远超一页，
+        只取第一页会让 status / stop-all / 对账静默漏掉后面的机器。"""
+        out = []
+        for page in range(1, max_pages + 1):
+            data = self._post("/api/v1/dev/instance/pro/list",
+                              {"page_index": page, "page_size": page_size}, idempotent=True)
+            items = (data or {}).get("list") or []
+            out.extend(items)
+            if len(items) < page_size:
+                break
+        return out
 
     def gpu_stock(self, region_sign, cuda_v_from=None, cuda_v_to=None):
         body = {"region_sign": region_sign}
@@ -169,7 +185,7 @@ class AutoDLClient:
             "gpu_spec_uuid": gpu_spec_uuid or c.gpu_spec_uuid,
             "image_uuid": image_uuid or c.image_uuid,
             "cuda_v_from": int(cuda_v_from if cuda_v_from is not None else c.cuda_v_from),
-            "instance_name": instance_name or c.instance_name,
+            "instance_name": _owned_name(c, instance_name or c.instance_name),
             "start_command": "sleep infinity",
         }
         dcl = data_center_list if data_center_list is not None else c.data_center_list

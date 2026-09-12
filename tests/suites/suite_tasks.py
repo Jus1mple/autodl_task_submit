@@ -72,7 +72,7 @@ class FakeSSH:
             stream(self.out)
         return self.out, "", self.code
 
-    def run_script(self, snap, text, run_id, uuid=None, prelude="", stream=None, max_capture=None):
+    def run_script(self, snap, text, run_id, uuid=None, prelude="", stream=None, max_capture=None, runner="bash"):
         self.commands.append(f"{prelude}bash task_{run_id}.sh")
         return self.out, "", self.code
 
@@ -80,7 +80,7 @@ class FakeSSH:
         self.commands.append(prelude + command)
         return {"pid": "123", "log": f"/l/{run_id}.log", "exit_file": f"/l/{run_id}.exit", "workdir": "/w"}
 
-    def run_background(self, snap, text, run_id, uuid=None, prelude=""):
+    def run_background(self, snap, text, run_id, uuid=None, prelude="", runner="bash"):
         return self.run_background_command(snap, f"bash task_{run_id}.sh", run_id, uuid, prelude)
 
     def poll(self, snap, meta, uuid=None):

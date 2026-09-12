@@ -54,7 +54,7 @@ class SSH:
         # job2 故意失败
         return ("", "", 1) if "fail_me" in command else ("out", "", 0)
 
-    def run_script(self, snap, text, rid, uuid=None, prelude="", stream=None, max_capture=None):
+    def run_script(self, snap, text, rid, uuid=None, prelude="", stream=None, max_capture=None, runner="bash"):
         return "out", "", 0
 
     def write_file(self, *a, **kw):
@@ -152,7 +152,7 @@ class CliCtx:
 def mkargs(**kw):
     base = dict(script=None, remote_script=None, remote=None, instance=None, background=False,
                 name=None, select_region=False, down=False, release=False, json=False,
-                sync=False, sync_mode="ff", setup=False, pull=None, pull_to="./results", dry_run=False)
+                sync=False, sync_mode="ff", setup=False, pull=None, pull_to="./results", dry_run=False, max_hours=None)
     base.update(kw)
     return types.SimpleNamespace(**base)
 

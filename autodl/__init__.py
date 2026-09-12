@@ -23,15 +23,15 @@ Python::
 
 from .config import Config, load_config, require_token
 from .core import Context
-from .errors import (APIError, AutoDLError, ConfigError, InsufficientBalance,
+from .errors import (APIError, AutoDLError, BudgetExceeded, ConfigError, InsufficientBalance,
                      RateLimited, SSHUnavailable)
 from .tasks import submit
 
-__version__ = "1.12.1"
+__version__ = "1.13.0"
 
 __all__ = [
     "connect", "submit", "Context", "Config", "load_config", "require_token",
-    "AutoDLError", "APIError", "ConfigError", "InsufficientBalance",
+    "AutoDLError", "APIError", "BudgetExceeded", "ConfigError", "InsufficientBalance",
     "RateLimited", "SSHUnavailable", "__version__",
 ]
 
