@@ -79,7 +79,7 @@ def run_batch(ctx, jobs, max_parallel=2, on_finish="release", select_region=True
                 with create_lock:  # 预检+选区+创建一体：避免多 worker 同时越过并发/预算上限(TOCTOU)
                     cost.check_budget(ctx, new_instance=True, reconcile_first=(widx == 0), log=None)
                     region = ctx.select_region(log=None) if select_region else None
-                    uuid = ctx.api.create(data_center_list=[region] if region else None)
+                    uuid = ctx.create_instance(region, log=wlog)
                     cost.on_power_on(ctx, uuid, None, "batch")  # 先占坑（并发上限可见），价格就绪后补
                 with clock:
                     created.append(uuid)

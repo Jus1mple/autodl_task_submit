@@ -66,7 +66,21 @@ class Context:
         cost.on_power_on(self, uuid, snap, "power_on", log=log)
         return snap
 
-    # ---------------- 选区 ----------------
+    # ---------------- 选区 / 创建 ----------------
+    def create_instance(self, region=None, log=print, **kw):
+        """创建实例。指定区域被平台以 RequestParameterIsWrong 拒绝时（实测 neimengDC3 会被拒，
+        库存接口的 region_sign 与 create 接受的取值不完全一致），回退为不指定区域自动调度。
+        参数错误的 create 不会产生实例，所以这次回退不会重复开机。"""
+        if region:
+            try:
+                return self.api.create(data_center_list=[region], **kw)
+            except APIError as e:
+                if e.code != "RequestParameterIsWrong":
+                    raise
+                if log:
+                    log(f"  区域 {region} 被 create 拒绝（{e.code}），回退自动调度")
+        return self.api.create(**kw)
+
     def select_region(self, log=print):
         """遍历偏好区域，返回第一个目标 GPU 有空闲的 region_sign；都没有则 None。"""
         target = self.cfg.gpu_stock_name
@@ -119,7 +133,7 @@ class Context:
             region = self.select_region(log=log) if select_region else None
             if select_region and not region and log:
                 log("  偏好区域均无空闲，回退自动调度创建。")
-            uuid = self.api.create(data_center_list=[region] if region else None)
+            uuid = self.create_instance(region, log=log)
             if log:
                 log(f"实例已创建: {uuid}")
             self.reg.upsert_instance(uuid, name=cost.instance_name(self.cfg), status_cached="creating")

@@ -261,6 +261,25 @@ except BudgetExceeded:
     check("新建超价释放", ("release", "pro-new") in ctx.api.calls, str(ctx.api.calls))
 check("新建实例名带前缀", ctx.reg.get_instance("pro-new") is None or True)
 
+# create_instance：区域被拒 → 回退自动调度；其它错误原样抛
+from autodl.errors import APIError as _APIError
+ctx = mkctx()
+def _bad_create(**kw):
+    ctx.api.calls.append(("create", kw))
+    if kw.get("data_center_list"):
+        raise _APIError("x", code="RequestParameterIsWrong")
+    return "pro-fb"
+ctx.api.create = _bad_create
+check("create 区域被拒回退", ctx.create_instance("neimengDC3", log=None) == "pro-fb"
+      and [c[1].get("data_center_list") for c in ctx.api.calls if c[0] == "create"] == [["neimengDC3"], None], str(ctx.api.calls))
+def _other(**kw):
+    raise _APIError("y", code="Forbidden")
+ctx.api.create = _other
+try:
+    ctx.create_instance("westDC2", log=None); check("create 其它错误不回退", False)
+except _APIError as e:
+    check("create 其它错误不回退", e.code == "Forbidden")
+
 # stop_all_running：默认只关我的
 ctx = mkctx()
 ctx.api.items = [item("pro-m", "kd/a"), item("pro-o", "other/b"), item("pro-m2", "kd/c", "shutdown")]

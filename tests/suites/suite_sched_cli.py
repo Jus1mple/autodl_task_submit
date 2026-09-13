@@ -92,6 +92,9 @@ class Ctx:
     def select_region(self, log=None):
         return "westDC2"
 
+    def create_instance(self, region=None, log=None, **kw):
+        return self.api.create(data_center_list=[region] if region else None, **kw)
+
     def finish_instance(self, uuid, mode="power_off", log=print, release_retries=3):
         self.finishes.append((uuid, mode))
         return True
