@@ -15,7 +15,7 @@ AutoDL GPU 云的 **Python 库 + 命令行工具**：开机/复用实例、传�
 ```bash
 uv tool install git+ssh://git@github.com/Jus1mple/autodl_task_submit.git   # 全局 autodl 命令
 # 或项目内当库用: uv add git+ssh://git@github.com/Jus1mple/autodl_task_submit.git
-# 或本地开发:     git clone ... && uv sync && uv run pytest   # 4 套测试，不触网，~8s
+# 或本地开发:     git clone ... && uv sync && uv run pytest   # 5 套测试，不触网，~10s
 
 echo 'AUTODL_TOKEN=你的Token' > .env  # Token 只放环境变量/.env，不进 yaml（已被 .gitignore）
 cp autodl.example.yaml autodl.yaml    # 可选：改实例规格/区域/预算/SSH/git 仓库
@@ -108,8 +108,9 @@ info = tasks.refresh_run(ctx, run)         # 探活/tail/完成登记/抓指标
 |---|---|
 | `balance` | 查余额 |
 | `stock [--region R]` | 查 GPU 库存（默认遍历偏好区域）|
-| `status` / `ls` | 列出所有实例，标注"带卡计费 / 仅磁盘计费" |
-| `stop-all [--release]` | 一键止损：关停所有 running 实例（`--release` 则彻底释放）|
+| `status` / `ls [--all]` | 列出**我的**实例（带卡计费 / 仅磁盘计费）+ 我的今日/本周/本月花费与烧钱速率；`--all` 看共享账号全部 |
+| `stop-all [--release] [--all]` | 一键止损：关停**我的** running 实例（别人的一律跳过，`--all` 才动全账号）|
+| `cost [--since 7d] [--by day\|instance\|session\|run]` | 我的花费报表（共享账号下只算我开机的时段）|
 | `up [--select-region]` | 拉起/复用实例，注入公钥免密，写 `~/.ssh/config`，打印 SSH/VSCode/Jupyter 直连信息 |
 | `use <instance_uuid>` | 登记一台**已有**实例为当前活动实例（不创建）|
 | `run ...` | 在实例上执行任务（见下；`--sync` 跑前先更新实例仓库）|
@@ -118,13 +119,15 @@ info = tasks.refresh_run(ctx, run)         # 探活/tail/完成登记/抓指标
 | `setup [--force] [--background]` | 按仓库依赖声明准备环境（hash 幂等，未变秒跳）|
 | `patch` | 把本地 patch 目录(git.patches)应用到实例（clone/sync 已自动带）|
 | `logs [--run-id R] [-f]` | 查看后台任务日志 + 退出码 + 指标；`-f/--follow` 实时跟随到完成 |
+| `kill [--run-id R]` | 终止后台任务（kill 实例上整个进程组，登记 exit=137）|
 | `runs [--limit N]` | 列出台账运行记录（含指标，只查本地）|
 | `push <本地目录> [子目录]` | rsync 同步本地到实例数据盘 |
 | `pull <远端子路径> [本地目录]` | rsync 从实例拉回产物 |
 | `down [--release]` | 关机（或释放）当前活动实例 |
 | `snapshot-env --name N [--instance U]` | 把实例环境存为私有镜像（持续占存储费，无删除 API，慎用）|
 | `idle-guard [--once] [--idle-minutes N]` | 空闲自动关机看门狗（GPU 利用率+显存双判，keepalive 文件可豁免）|
-| `balance-watch --warn Y --stop Y` | 余额预警/急停守护（低于急停线自动关停）|
+| `balance-watch --warn Y --stop Y` | 余额预警/急停守护（默认只关我的实例）|
+| `budget-guard [--once]` | 个人预算/开机时长守护：触顶只关我的实例 |
 | `batch --file jobs.yaml [--max-parallel N]` | 批量并行调度：多实例跑多任务，记 run 台账、支持 resume |
 
 通用参数放在命令**后面**：`--config`、`--dry-run`、`--yes/-y`、`--json`。
@@ -135,6 +138,7 @@ info = tasks.refresh_run(ctx, run)         # 探活/tail/完成登记/抓指标
 - `--script <本地路径>`：上传本地 bash 脚本再执行
 - `--down` 跑完关机（保留磁盘环境，下次自动开机复用）；`--release` 彻底释放；`--background` 后台脱机（不能与 `--down/--release` 同用，跑完自行 `autodl down`）
 - 前台/后台运行都记入台账、自动抓指标；`run_id` 自动生成唯一 id（`--name` 可指定）
+- `--max-hours H`：任务时限，实例侧 `timeout` 实现，本地断网也生效（超时 exit=124）；默认 `budget.max_run_hours`
 - `--pull '<glob>' --pull-to <目录>`：**任务完成自动把结果文件拉回本地**（与自动抓指标同一时机）。glob 逗号分隔、相对数据盘、保留相对结构，如 `--pull 'output/checkpoint-*/adapter*.safetensors,metrics.json' --pull-to ./results`。后台任务在 `autodl logs` 检测到完成时拉回。只改本地、不动实例。
 
 ## 远程 git 工作流：改代码 → push → 实例更新 → 重跑
@@ -234,6 +238,28 @@ autodl balance-watch --warn 50 --stop 10 --interval 300
 ```
 两者都靠客户端轮询实现（AutoDL 无空闲关机开关、无 webhook）。SSH 连不上时看门狗会回退查实例状态，**绝不把"网络不通"误判成"空闲"而误关**。
 
+## 共享账号：只算我的账、只限我自己
+
+账号很多人共用时，余额是大家的，余额差分算不出你的份，AutoDL 也没有账单 API。`autodl` 用**归属式记账**：每次由它开机/关机就记一条 session，费用 = 该实例小时价（`payg_price`）× 时长，和官方按秒计费公式一致；每次 `status`/`cost` 都用平台的开关机时间对账。
+
+```yaml
+owner: kedong                 # 新建实例名带 "kedong/" 前缀；status/stop-all/守护默认只认我的
+budget:
+  daily_yuan: 80              # 今日花费上限，触顶拒绝开机/提交（退出码 7）
+  max_session_hours: 12       # 单次开机保险丝：实例内挂 shutdown 定时器，本地断网也自关
+  max_run_hours: 6            # 任务默认时限（run --max-hours 覆盖）
+  max_concurrent: 2           # 我同时 running 的台数
+  max_price_per_hour: 3.0     # 单台小时价上限，新建超价立即释放
+```
+
+```bash
+autodl cost --since 7d --by instance   # 我最近 7 天花在哪几台上
+autodl cost --by run                   # 每个 run 多少钱；run 之间的空档就是闲置开销
+autodl budget-guard &                  # 触顶/超时长只关我的实例，绝不碰别人的
+```
+
+这是归属估算不是发票（单价按开机时快照、代金券看不到），月底拿控制台账单按自己的实例 uuid 对一次即可。详见 `USAGE.md` §11。
+
 ## 环境固化
 
 ```bash
@@ -248,7 +274,8 @@ autodl snapshot-env --name myenv-v1 --instance pro-xxxx
 - **HTTP 稳健层**：超时 + 对只读接口指数退避重试；`create`/`power_*`/`release` 等写接口**绝不自动重试**，避免重复开机/重复扣费。
 - **SSH 连接层**：失败按根因分类（实例已关机 / 跳板不通 / 端口未就绪 / 认证失败），不会把"网络不通"误判成"实例已关机"。
 - **凭据安全**：首连后注入本地 SSH 公钥走免密，`root_password` 只在内存用一次，不进命令行/日志。
-- **本地台账**：`.autodl/registry.db`（带文件锁的 SQLite）记录实例与任务（前台/后台/批量都进同一张 runs 表）。
+- **本地台账**：`.autodl/registry.db`（带文件锁的 SQLite）记录实例与任务（前台/后台/批量都进同一张 runs 表）；**个人账本** `~/.autodl/ledger.db`（`autodl/cost.py`）记我的开机 session 与费用，人级跨项目。
+- **共享账号安全**：`stop-all` / `balance-watch` / `budget-guard` 默认只作用于我的实例；`list` 接口自动翻页，实例多于一页也不会漏。
 - **GET 接口走 query string**：AutoDL 网关会丢弃 GET 的 body（这是早期踩过的坑）。
 
 > 旧入口 `submit.py` 仍可用（`uv run python submit.py`），是包之上的薄封装，等价于 `autodl run --script <脚本> --down`。可视化大盘见 `web-dashboard` 分支。

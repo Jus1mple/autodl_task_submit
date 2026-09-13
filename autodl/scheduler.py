@@ -14,7 +14,7 @@ import queue
 import threading
 from concurrent.futures import ThreadPoolExecutor
 
-from . import tasks
+from . import cost, tasks
 from .errors import AutoDLError, SSHUnavailable
 
 
@@ -76,18 +76,18 @@ def run_batch(ctx, jobs, max_parallel=2, on_finish="release", select_region=True
         wlog = (lambda m: log(f"[w{widx}] {m}")) if log else None
         try:
             try:
-                if select_region:
-                    with create_lock:  # 选区与创建之间不被其它 worker 插入
-                        region = ctx.select_region(log=None)
-                        uuid = ctx.api.create(data_center_list=[region] if region else None)
-                else:
-                    uuid = ctx.api.create()
+                with create_lock:  # 预检+选区+创建一体：避免多 worker 同时越过并发/预算上限(TOCTOU)
+                    cost.check_budget(ctx, new_instance=True, reconcile_first=(widx == 0), log=None)
+                    region = ctx.select_region(log=None) if select_region else None
+                    uuid = ctx.create_instance(region, log=wlog)
+                    cost.on_power_on(ctx, uuid, None, "batch")  # 先占坑（并发上限可见），价格就绪后补
                 with clock:
                     created.append(uuid)
                 ctx.reg.upsert_instance(uuid, name=f"{ctx.cfg.instance_name}-{batch_id}",
                                         tags=batch_id, status_cached="creating")
                 snap = ctx.api.wait_running(uuid, log=None)
                 ctx.reg.upsert_instance(uuid, status_cached="running", region=snap.get("region_sign"))
+                cost.on_power_on(ctx, uuid, snap, "batch", log=wlog)
                 if log:
                     log(f"[w{widx}] 实例就绪 {uuid}")
             except AutoDLError as e:

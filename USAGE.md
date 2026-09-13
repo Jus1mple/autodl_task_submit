@@ -67,8 +67,18 @@ req_gpu_amount: 1                   # 单机卡数 1–4
 data_center_list: []                # 空 = AutoDL 自动调度
 regions: [westDC2, westDC3, beijingDC1]   # stock / --select-region 遍历的偏好区域
 gpu_stock_name: vGPU-48GB           # 库存匹配的型号名（对应 gpu_spec_uuid）
-min_balance_yuan: 10.0              # 余额护栏：低于此值拒绝开机/提交
-registry_path: .autodl/registry.db  # 本地台账（SQLite）
+min_balance_yuan: 10.0              # 余额护栏：低于此值拒绝开机/提交（共享账号下只是兜底）
+registry_path: .autodl/registry.db  # 本地台账（SQLite，项目级）
+owner: ""                           # 我的标识（共享账号）：新建实例名带 "<owner>/" 前缀，止损/记账只认我的，见 §11
+budget:                             # 个人预算与配额（0=不限），见 §11
+  daily_yuan: 0
+  weekly_yuan: 0
+  monthly_yuan: 0
+  max_session_hours: 0              # 单次开机保险丝（实例内 shutdown 定时器）
+  max_run_hours: 0                  # 任务默认时限（run --max-hours 覆盖）
+  max_concurrent: 0                 # 我同时 running 的台数上限
+  max_price_per_hour: 0             # 单台小时价上限（元）
+  ledger_path: ~/.autodl/ledger.db  # 个人账本（人级，跨项目）
 
 http:                               # HTTP 稳健层
   timeout_connect: 10.0
@@ -118,8 +128,9 @@ env:                                # 实例环境准备（setup / run --setup�
 |---|---|
 | `autodl balance` | 账户余额 |
 | `autodl stock [--region R]` | GPU 库存（区域 × 型号的空闲/总数；默认遍历 `regions`）|
-| `autodl status` / `ls` | 所有实例 + 计费分类（带卡 / 仅磁盘），`*` 标活动实例 |
+| `autodl status` / `ls [--all]` | **我的**实例 + 计费分类（带卡 / 仅磁盘）+ 我的今日/本周/本月花费与烧钱速率，`*` 标活动实例；`--all` 看共享账号里所有人的 |
 | `autodl runs [--limit N]` | 本地台账的运行记录（含指标；只查本地不触网）|
+| `autodl cost [--since 7d] [--by day\|instance\|session\|run] [--offline]` | 我的花费报表（§11）|
 
 ### 实例生命周期
 
@@ -128,7 +139,7 @@ env:                                # 实例环境准备（setup / run --setup�
 | `autodl up [--select-region]` | 复用活动实例（关机自动开机）或新建；注入 SSH 公钥免密、写 `~/.ssh/config` 别名、打印 SSH/VSCode/Jupyter 直连信息 |
 | `autodl use <uuid>` | 登记一台**已有**实例为活动实例（不创建）|
 | `autodl down [--release]` | 关机（`--release` 则释放）活动实例；release 前轮询等真正 shutdown，失败会重试并显著告警 |
-| `autodl stop-all [--release]` | **一键止损**：关停所有 running 实例；单台失败不影响其余 |
+| `autodl stop-all [--release] [--all]` | **一键止损**：关停**我的** running 实例（共享账号里别人的一律跳过；`--all` 才动全账号）；单台失败不影响其余 |
 | `autodl snapshot-env --name N [--instance U] [--no-wait]` | 实例环境存为私有镜像。⚠️ AutoDL 无删除镜像 API，持续占存储费 |
 
 ### 跑任务（核心）
@@ -137,7 +148,7 @@ env:                                # 实例环境准备（setup / run --setup�
 autodl run (--remote-script 实例上的脚本 | --remote "任意命令" | --script 本地脚本) \
     [--instance U] [--background] [--name RUN_ID] [--select-region] \
     [--down | --release] [--sync [--sync-mode ff|stash|reset]] [--setup] \
-    [--pull '<glob,glob>' [--pull-to 目录]]
+    [--pull '<glob,glob>' [--pull-to 目录]] [--max-hours H]
 ```
 
 - 三种执行方式互斥：`--remote-script`（跑实例上已有脚本，`~` 正确展开）/ `--remote`（任意命令）/ `--script`（上传本地脚本再跑）。
@@ -146,6 +157,7 @@ autodl run (--remote-script 实例上的脚本 | --remote "任意命令" | --scr
 - `--sync`：跑之前把实例仓库更新到 remote 最新（缺仓库自动 clone、有 patch 自动重放），失败即中止不浪费卡时。
 - `--setup`：跑之前按依赖声明准备环境（hash 幂等，没变秒跳）。
 - `--pull 'glob1,glob2' --pull-to DIR`：**任务完成自动把结果文件拉回本地**（保留相对结构）。前台内联拉；后台在 `logs` 检测到完成时拉。
+- `--max-hours H`：任务时限。实例侧 `timeout` 包住命令，本地进程退出/断网依然生效；到点先 TERM、60 秒后 KILL，退出码 124，不重试。不给则用 `budget.max_run_hours`。
 - 每次运行前会清掉实例上的旧 `metrics.json`，防止指标串台。
 
 ### 看进度 / 拿结果
@@ -154,6 +166,7 @@ autodl run (--remote-script 实例上的脚本 | --remote "任意命令" | --scr
 |---|---|
 | `autodl logs [--run-id R] [--lines N]` | tail 后台任务日志 + 状态 + 退出码 + 指标；完成时自动登记、抓指标、拉产物 |
 | `autodl logs -f` / `--follow` | **实时跟随**（tail -f 语义）：tqdm 进度条原样刷新，任务结束自动收尾退出；Ctrl-C 只停跟随不停任务 |
+| `autodl kill [--run-id R]` | **终止后台任务**：kill 实例上的整个进程组（setsid 会话），登记 exit=137；默认最近一个 running 的后台任务 |
 | `autodl push <本地目录> [子目录]` | rsync 同步本地 → 实例数据盘（默认 `code/`）|
 | `autodl pull <远端子路径> [本地目录]` | rsync 实例 → 本地（手动拉任意文件；声明式拉回用 `run --pull`）|
 
@@ -182,7 +195,8 @@ autodl batch --file jobs.yaml [--max-parallel N] [--on-finish release|power_off|
 | 命令 | 说明 |
 |---|---|
 | `autodl idle-guard [--idle-minutes 15] [--once]` | 空闲自动关机看门狗（GPU 利用率 + 显存双判；实例上 `touch /root/.autodl_keepalive` 豁免；SSH 不通绝不误判为空闲）|
-| `autodl balance-watch --warn 50 --stop 10` | 余额预警/急停（低于急停线自动关停）|
+| `autodl balance-watch --warn 50 --stop 10 [--stop-mode mine\|active\|stop_all]` | 账户余额预警/急停；默认 `mine` 只关我的实例 |
+| `autodl budget-guard [--interval 300] [--once]` | **个人预算守护**：今日/本周/本月花费触顶 → 关停我的全部 running；某台连续开机超 `max_session_hours` → 只关那台。绝不碰别人的（§11）|
 
 ### 退出码
 
@@ -193,6 +207,7 @@ autodl batch --file jobs.yaml [--max-parallel N] [--on-finish release|power_off|
 | 2 | 用法/配置错误 |
 | 3 | 余额低于 `min_balance_yuan` |
 | 5 | SSH 不可达 |
+| 7 | 个人预算/配额触顶（`budget.*`）|
 | 6 | 远端任务非零退出 |
 | 130 | Ctrl-C |
 
@@ -274,7 +289,9 @@ autodl balance-watch --warn 50 --stop 10 &     # 余额告警/急停
 | `run --background` | `run_id, pid, log, exit_file, instance` |
 | `logs` | `run_id, status, exit_code, instance, log, note, metrics, artifacts` |
 | `runs` | `runs: [{run_id, status, exit_code, instance, experiment_id, tag, started_at, metrics}]` |
-| `status` | `balance_yuan, instances: [{instance_uuid, status, billing, region, active}]` |
+| `status` | `balance_yuan, instances: [{instance_uuid, name, status, billing, region, active, mine}], usage: {today, week, month, disk_month, burn_rate, running, sessions_open}` |
+| `cost` | `rows: [...], total, disk, since, until, usage`（rows 字段随 `--by` 变化）|
+| `kill` | `run_id, killed, state, note` |
 | `clone` | `dir, branch, head, created, credentials, patches` |
 | `sync` | `dir, branch, mode, old, new, updated, dirty, blocked, error, message, patches` |
 | `setup` | `skipped, source, command, exit_code`（或后台句柄）|
@@ -341,8 +358,37 @@ info = tasks.refresh_run(ctx, ctx.reg.get_run(meta["run_id"]))   # 探活/tail/�
 ## 10. 成本与安全设计（内建，无需配置）
 
 - **写接口绝不自动重试**（create/power_on/power_off/release），避免重复开机重复扣费；只读接口指数退避重试。
-- **余额护栏**：低于 `min_balance_yuan` 拒绝开机/提交（退出码 3）。
+- **余额护栏**：低于 `min_balance_yuan` 拒绝开机/提交（退出码 3）。共享账号下这只是兜底，按人限额见 §11。
+- **止损只关我的**：`stop-all` / `balance-watch` / `budget-guard` 默认只作用于我的实例（owner 前缀或本地登记过）；碰别人的必须显式 `--all` / `--stop-mode stop_all`。
 - **收尾必达**：任务失败也执行 `--down/--release`；release 前轮询等真正 shutdown、业务失败码算失败并重试、最终失败**显著告警**绝不静默泄漏计费。
 - **凭据安全**：`root_password` 只在内存用一次不进命令行/日志；首连注入 SSH 公钥走免密；git token 走凭据文件（0600）。
 - **误关保护**：idle-guard 用利用率+显存双判、支持 keepalive 豁免、SSH 不通绝不当作空闲。
 - **危险操作确认**：`down`/`stop-all`/`snapshot-env` 需确认（`--yes` 跳过，`--dry-run` 预览）。
+
+## 11. 共享账号：只算我的账、只限我自己
+
+账号被很多人共用时，余额是大家的，余额差分算不出"我花了多少"；AutoDL 也没有账单 API。`autodl` 改用**归属式记账**：
+
+- **口径**：一条 session = 我让某台实例处于 running 的一段时间，费用 = 该实例小时价（snapshot 的 `payg_price`，折后价）× 秒数 ÷ 3600。这与官方"按秒计费、时长 = 关机时间 − 开机时间"一致。关机不释放的数据盘另按 ¥0.01/GB/天 估算。
+- **记账时机**：本工具每次开机/创建/关机/释放自动开关 session；每次 `status` / `cost` / 预检前都用平台的 `started_at` / `stopped_at` **对账**——别人从控制台开关了我的机也能追平；实例从账号里消失则结清并标记释放。
+- **"我的"边界**：`owner: kedong` 后新建实例名为 `kedong/task-runner`。对账按前缀认领，换电脑、账本丢了也能重建；`use` 登记过的实例同样算我的。
+- **账本**是人级的（`~/.autodl/ledger.db`，跨项目），run/指标台账仍是项目级的。`cost --by run` 会把两者按实例和时间对上。
+
+四层限制，各管一件事：
+
+| 层 | 配置 / 参数 | 机制 |
+|---|---|---|
+| 单次任务 | `run --max-hours H` / `budget.max_run_hours` | 实例侧 `timeout` 包住命令，本地进程死了也生效；超时 exit=124 |
+| 单次开机 | `budget.max_session_hours` | 开机时在实例内挂 `sleep N; shutdown` 保险丝（AutoDL：实例内 `shutdown` 即关机），笔记本合盖/断网也自关 |
+| 额度 | `budget.daily/weekly/monthly_yuan` | 开机/创建/提交/batch 前预检，触顶退出码 7；`budget-guard` 守护触顶关停我的实例 |
+| 资源 | `budget.max_concurrent` / `max_price_per_hour` | 创建/开机前拦；新建实例价格只有就绪后才知道，超价**立即释放**并报错 |
+
+```bash
+autodl cost                          # 本月按天
+autodl cost --since 7d --by instance # 最近 7 天按实例
+autodl cost --by session             # 每段开机：谁开的(source)、哪个项目、多少钱
+autodl cost --by run                 # 每个 run 的费用（run 之间的空档 = 闲置开销，在 session 里看）
+autodl budget-guard --interval 300 & # 守护
+```
+
+精度边界（诚实说明）：这是**归属估算**，不是发票。单价按开机时快照，平台改价不追；代金券/折扣变动看不到；别人用我的实例也会算到我头上（所以要贴 owner 前缀）；`payg_price` 单位文档未明示，按"元×1000"处理——已实测：3090 单卡 `payg_price=1780` 即 ¥1.78/h，一段 0.05h 的 session 记 ¥0.09，账户余额同时刻恰好减少 ¥0.09。月底用控制台账单按我的实例 uuid 筛一遍对账即可。

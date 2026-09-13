@@ -62,7 +62,7 @@ wheels = [
 
 [[package]]
 name = "autodl-task-submit"
-version = "1.12.1"
+version = "1.13.1"
 source = { editable = "." }
 dependencies = [
     { name = "paramiko" },

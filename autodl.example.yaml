@@ -19,7 +19,20 @@ stock_region: westDC2
 gpu_stock_name: vGPU-48GB                  # 库存里对应 v-48g 的型号名
 
 # 护栏
-min_balance_yuan: 10.0               # 余额低于此值则中止开机
+min_balance_yuan: 10.0               # 账户余额低于此值则中止开机（共享账号下只是兜底，真正约束我的是 budget）
+
+# 共享账号：只算"我自己"的账、只限制"我自己"（详见 USAGE.md §11）
+owner: ""                            # 我的标识，如 kedong：新建实例名带 "kedong/" 前缀；
+                                     # status/stop-all/守护默认只认带前缀或本地登记过的实例
+budget:                              # 0 = 不限。费用口径 = 我开机时段 × 实例小时价（与官方按秒计费一致）
+  daily_yuan: 0                      # 今日我的花费上限（触顶拒绝开机/提交，退出码 7）
+  weekly_yuan: 0
+  monthly_yuan: 0
+  max_session_hours: 0               # 单次开机保险丝：开机时在实例内挂 `sleep N; shutdown`，本地断网也生效
+  max_run_hours: 0                   # 单个任务默认时限（run --max-hours 覆盖）：实例侧 timeout，超时 exit=124
+  max_concurrent: 0                  # 我同时 running 的实例数上限
+  max_price_per_hour: 0              # 单台实例小时价上限（元）：开机超价拒绝，新建超价立即释放
+  ledger_path: ~/.autodl/ledger.db   # 个人账本，跨项目按人汇总（autodl cost 查）
 
 # 本地状态
 registry_path: .autodl/registry.db   # 多实例台账（替代旧的 .instance_uuid）

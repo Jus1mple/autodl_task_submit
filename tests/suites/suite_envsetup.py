@@ -33,7 +33,7 @@ class LocalSSH:
             stream(r.stdout)
         return r.stdout, r.stderr, r.returncode
 
-    def run_script(self, snap, text, rid, uuid=None, prelude="", stream=None, max_capture=None):
+    def run_script(self, snap, text, rid, uuid=None, prelude="", stream=None, max_capture=None, runner="bash"):
         return self.run(snap, prelude + text, uuid, stream)
 
     def write_file(self, snap, path, content, uuid=None):

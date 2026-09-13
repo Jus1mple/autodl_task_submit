@@ -1,13 +1,16 @@
-"""高层编排：复用/新建实例、库存驱动选区、余额差分计费。
+"""高层编排：复用/新建实例、库存驱动选区、个人记账与预算护栏。
 
 把零散的生命周期逻辑收口到一处，供各 CLI 子命令调用。
+每个开机/关机/释放入口都挂了 cost.* 钩子：共享账号下只记"我的"那份账。
 """
 from __future__ import annotations
 
 import time
 
+from . import cost
 from .api import AutoDLClient
-from .errors import APIError, AutoDLError
+from .cost import Ledger
+from .errors import APIError, AutoDLError, BudgetExceeded
 from .registry import Registry
 from .ssh import SSHManager
 
@@ -32,8 +35,52 @@ class Context:
         self.api = AutoDLClient(cfg)
         self.reg = Registry(cfg.registry_abspath)
         self.ssh = SSHManager(cfg.ssh, self.api)
+        self.ledger = Ledger(cfg.ledger_abspath)   # 个人账本（人级，跨项目）
 
-    # ---------------- 选区 ----------------
+    # ---------------- 记账辅助 ----------------
+    def _list_item(self, uuid):
+        """list 接口里该实例的条目（含平台 started_at 等）；拿不到返回 None。"""
+        try:
+            for it in self.api.list_instances():
+                if (it.get("uuid") or it.get("instance_uuid")) == uuid:
+                    return it
+        except APIError:
+            pass
+        return None
+
+    def _price_of(self, uuid):
+        """开机前尽力取小时价（元）做预算预检；取不到返回 None（关机实例的 snapshot 未必可用）。"""
+        try:
+            return cost.price_milli(self.api.snapshot(uuid)) / cost.PRICE_UNIT or None
+        except APIError:
+            return None
+
+    def _power_on_checked(self, uuid, log):
+        """开机三步：预算预检 → power_on → 记账。"""
+        cost.check_budget(self, price=self._price_of(uuid), new_instance=True, log=log)
+        self.api.power_on(uuid)
+        if log:
+            log(f"开机中: {uuid}")
+        snap = self.api.wait_running(uuid, log=log)
+        self.reg.upsert_instance(uuid, status_cached="running")
+        cost.on_power_on(self, uuid, snap, "power_on", log=log)
+        return snap
+
+    # ---------------- 选区 / 创建 ----------------
+    def create_instance(self, region=None, log=print, **kw):
+        """创建实例。指定区域被平台以 RequestParameterIsWrong 拒绝时（实测 neimengDC3 会被拒，
+        库存接口的 region_sign 与 create 接受的取值不完全一致），回退为不指定区域自动调度。
+        参数错误的 create 不会产生实例，所以这次回退不会重复开机。"""
+        if region:
+            try:
+                return self.api.create(data_center_list=[region], **kw)
+            except APIError as e:
+                if e.code != "RequestParameterIsWrong":
+                    raise
+                if log:
+                    log(f"  区域 {region} 被 create 拒绝（{e.code}），回退自动调度")
+        return self.api.create(**kw)
+
     def select_region(self, log=print):
         """遍历偏好区域，返回第一个目标 GPU 有空闲的 region_sign；都没有则 None。"""
         target = self.cfg.gpu_stock_name
@@ -66,18 +113,14 @@ class Context:
                 if st in _REUSABLE_DIRECT:
                     snap = self.api.snapshot(uuid)
                     self.reg.upsert_instance(uuid, status_cached=st)
+                    cost.on_power_on(self, uuid, snap, "adopt", item=self._list_item(uuid))
                     return uuid, snap
                 if st in _REUSABLE_AFTER_POWERON:
-                    self._record_balance(uuid)
-                    self.api.power_on(uuid)
-                    if log:
-                        log(f"开机中: {uuid}")
-                    snap = self.api.wait_running(uuid, log=log)
-                    self.reg.upsert_instance(uuid, status_cached="running")
-                    return uuid, snap
+                    return uuid, self._power_on_checked(uuid, log)
                 if st in _TRANSIENT_BOOTING:
                     snap = self.api.wait_running(uuid, log=log)
                     self.reg.upsert_instance(uuid, status_cached="running")
+                    cost.on_power_on(self, uuid, snap, "adopt", log=log)
                     return uuid, snap
                 # removed / None / 其它 → 记录失效
                 if log:
@@ -85,22 +128,34 @@ class Context:
                 self.reg.remove_instance(uuid)
                 self.reg.set_active(None)
 
-            # 新建
+            # 新建（新计费）：先过预算/并发预检
+            cost.check_budget(self, new_instance=True, log=log)
             region = self.select_region(log=log) if select_region else None
             if select_region and not region and log:
                 log("  偏好区域均无空闲，回退自动调度创建。")
-            uuid = self.api.create(data_center_list=[region] if region else None)
+            uuid = self.create_instance(region, log=log)
             if log:
                 log(f"实例已创建: {uuid}")
-            self.reg.upsert_instance(uuid, name=self.cfg.instance_name, status_cached="creating")
+            self.reg.upsert_instance(uuid, name=cost.instance_name(self.cfg), status_cached="creating")
             self.reg.set_active(uuid)
-            self._record_balance(uuid)
             snap = self.api.wait_running(uuid, log=log)
             self.reg.upsert_instance(
                 uuid, status_cached="running", region=snap.get("region_sign"),
                 gpu_spec=snap.get("snapshot_gpu_alias_name"),
             )
+            self._after_create(uuid, snap, "create", log)
             return uuid, snap
+
+    def _after_create(self, uuid, snap, source, log):
+        """新建实例就绪后：记账 + 单价上限后置检查（创建前拿不到价格）。超价立即释放。"""
+        cost.on_power_on(self, uuid, snap, source, log=log)
+        cap = float(getattr(self.cfg.budget, "max_price_per_hour", 0) or 0)
+        p = cost.price_milli(snap) / cost.PRICE_UNIT
+        if cap and p > cap:
+            if log:
+                log(f"  ⚠️ 新实例单价 ¥{p:.2f}/h 超过 budget.max_price_per_hour=¥{cap:.2f}，立即释放")
+            self.finish_instance(uuid, "release", log=log)
+            raise BudgetExceeded(f"新实例 {uuid} 单价 ¥{p:.2f}/h 超过上限 ¥{cap:.2f}，已释放")
 
     def use_instance(self, uuid, log=print):
         """登记一台已有实例为当前活动实例（不创建）。返回其当前状态。"""
@@ -122,17 +177,15 @@ class Context:
         if st == "shutting_down":
             st = self._wait_until(uuid, _REUSABLE_AFTER_POWERON | {"shutdown"}, log)
         if st in _REUSABLE_DIRECT:
-            return self.api.snapshot(uuid)
-        if st in _REUSABLE_AFTER_POWERON:
-            self._record_balance(uuid)
-            self.api.power_on(uuid)
-            if log:
-                log(f"开机中: {uuid}")
-            snap = self.api.wait_running(uuid, log=log)
-            self.reg.upsert_instance(uuid, status_cached="running")
+            snap = self.api.snapshot(uuid)
+            cost.on_power_on(self, uuid, snap, "adopt", item=self._list_item(uuid))
             return snap
+        if st in _REUSABLE_AFTER_POWERON:
+            return self._power_on_checked(uuid, log)
         if st in _TRANSIENT_BOOTING:
-            return self.api.wait_running(uuid, log=log)
+            snap = self.api.wait_running(uuid, log=log)
+            cost.on_power_on(self, uuid, snap, "adopt", log=log)
+            return snap
         raise APIError(f"实例 {uuid} 状态异常无法使用: {st}", code=st)
 
     def _wait_until(self, uuid, target_states, log, max_tries=36, interval=5):
@@ -146,13 +199,26 @@ class Context:
         return self.api.status_or_none(uuid)
 
     # ---------------- 批量止损 ----------------
-    def stop_all_running(self, release=False, log=print):
-        """关停所有 running 实例（release=True 则进一步释放）。
+    def running_instances(self, scope="mine"):
+        """账号里 running 的实例。scope=mine 只要我的（owner 前缀 / 账本 / 台账登记过）；all 全部。
+        返回 (mine_or_all, skipped_others)。"""
+        items = [it for it in self.api.list_instances() if it.get("status") == "running"]
+        if scope == "all":
+            return [it for it in items if (it.get("uuid") or it.get("instance_uuid"))], []
+        mine, others = [], []
+        for it in items:
+            (mine if cost.is_mine(self, it) else others).append(it)
+        return mine, others
+
+    def stop_all_running(self, release=False, scope="mine", log=print):
+        """关停 running 实例（release=True 则进一步释放）。**默认只关我的**（scope=mine）：
+        共享账号里 stop_all 会误杀别人的训练，scope=all 必须显式指定。
         单台失败**不影响其余**（这是唯一的急停路径，绝不能因一台报错放弃其它）。
-        返回 {"processed": [...], "failed": [...]}。"""
-        running = [it.get("instance_uuid") or it.get("uuid")
-                   for it in self.api.list_instances() if it.get("status") == "running"]
-        running = [u for u in running if u]
+        返回 {"processed": [...], "failed": [...], "skipped_others": n}。"""
+        items, others = self.running_instances(scope)
+        running = [it.get("uuid") or it.get("instance_uuid") for it in items]
+        if others and log:
+            log(f"  跳过 {len(others)} 台别人的 running 实例（--all 才会碰）")
         failed = []
         for u in running:
             try:
@@ -160,6 +226,7 @@ class Context:
                 if log:
                     log(f"  关机 {u}: {r.get('code')} {r.get('msg')}")
                 self.reg.upsert_instance(u, status_cached="shutdown")
+                cost.on_power_off(self, u, log=log)
             except AutoDLError as e:
                 failed.append(u)
                 if log:
@@ -172,6 +239,7 @@ class Context:
                     if log:
                         log(f"  释放 {u}: {r.get('code')} {r.get('msg')}")
                     self.reg.remove_instance(u)
+                    cost.on_release(self, u, log=log)
                 except AutoDLError as e:
                     if u not in failed:
                         failed.append(u)
@@ -181,7 +249,8 @@ class Context:
                 self.reg.set_active(None)
         if failed and log:
             log(f"⚠️ {len(failed)} 台未成功处理、仍在计费: {failed} —— 请手动 `autodl stop-all --release` 或去控制台处理")
-        return {"processed": [u for u in running if u not in failed], "failed": failed}
+        return {"processed": [u for u in running if u not in failed], "failed": failed,
+                "skipped_others": len(others)}
 
     # ---------------- 环境固化为私有镜像 ----------------
     def snapshot_env(self, instance_uuid, image_name, wait=True, poll_interval=10, max_tries=180, log=print):
@@ -205,30 +274,14 @@ class Context:
             log("  保存超时（镜像可能仍在后台生成，可稍后用 image_list 查看）")
         return image_uuid
 
-    # ---------------- 余额差分计费 ----------------
-    def _record_balance(self, uuid):
-        try:
-            self.reg.upsert_instance(uuid, last_balance=self.api.balance_yuan())
-        except APIError:
-            pass
-
+    # ---------------- 关机 + 记账 ----------------
     def power_off_with_cost(self, uuid, log=print):
-        """关机并用余额差分粗估本段花费（仅在单实例独占计费时才准）。"""
-        inst = self.reg.get_instance(uuid)
-        before = inst.get("last_balance") if inst else None
+        """关机并结算本段 session（单价 × 时长）。共享账号下不再用余额差分——那算不出我的份。"""
         resp = self.api.power_off(uuid)
         if log:
             log(f"  关机: {resp.get('code')} {resp.get('msg')}")
         self.reg.upsert_instance(uuid, status_cached="shutdown")
-        try:
-            after = self.api.balance_yuan()
-            if before is not None:
-                spent = before - after
-                if log:
-                    log(f"  本段余额变化 ¥{spent:.2f}（差分粗估：期间账户的其它计费——"
-                        f"其它实例/弹性部署/存储——都会算进来，仅单实例独占账户时才是本段费用）")
-        except APIError:
-            pass
+        cost.on_power_off(self, uuid, log=log)
 
     # ---------------- 统一收尾 ----------------
     def finish_instance(self, uuid, mode="power_off", log=print, release_retries=3):
@@ -269,6 +322,7 @@ class Context:
                     f"请尽快 `autodl stop-all --release` 或去控制台处理。")
             return False
         self.reg.remove_instance(uuid)
+        cost.on_release(self, uuid, log=log)
         if self.reg.get_active() == uuid:
             self.reg.set_active(None)
         return True

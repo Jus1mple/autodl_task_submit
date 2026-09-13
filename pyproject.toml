@@ -1,6 +1,6 @@
 [project]
 name = "autodl-task-submit"
-version = "1.12.1"
+version = "1.13.1"
 description = "Reliable CLI for the AutoDL GPU cloud: instance lifecycle, remote tasks, cost guards, idle auto-shutdown, and batch scheduling."
 readme = "README.md"
 requires-python = ">=3.9"

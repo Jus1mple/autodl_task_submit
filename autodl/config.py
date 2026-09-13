@@ -63,8 +63,23 @@ class SSHConfig:
 
 
 @dataclass
+class BudgetConfig:
+    """个人预算与配额（共享账号下只约束"我自己"的用量）。0 = 不限。
+    费用口径：我开机的时段 × 该实例小时价（与 AutoDL 按秒计费公式一致），与账户余额无关。"""
+    daily_yuan: float = 0.0          # 今日（本地时区 0 点起）我的花费上限
+    weekly_yuan: float = 0.0         # 本周（周一起）
+    monthly_yuan: float = 0.0        # 本月（1 号起）
+    max_session_hours: float = 0.0   # 单次开机最长时长：开机时在实例内挂 shutdown 定时器（保险丝）
+    max_run_hours: float = 0.0       # 单个任务默认时限（run --max-hours 覆盖）；到点 timeout 杀进程
+    max_concurrent: int = 0          # 我同时 running 的实例数上限
+    max_price_per_hour: float = 0.0  # 单台实例小时价上限（元）；新建超价即释放，开机超价拒绝
+    ledger_path: str = "~/.autodl/ledger.db"  # 个人账本（跨项目，按人算）
+
+
+@dataclass
 class Config:
     base_url: str = "https://api.autodl.com"
+    owner: str = ""                  # 我的标识：新建实例名加 "<owner>/" 前缀，止损/记账只认带前缀或台账登记的实例
     image_uuid: str = "base-image-12be412037"
     gpu_spec_uuid: str = "v-48g"
     cuda_v_from: int = 111
@@ -81,6 +96,7 @@ class Config:
     ssh: SSHConfig = field(default_factory=SSHConfig)
     git: GitConfig = field(default_factory=GitConfig)
     env: EnvConfig = field(default_factory=EnvConfig)
+    budget: BudgetConfig = field(default_factory=BudgetConfig)
 
     # 运行时填充（不来自 YAML）
     token: str = field(default="", repr=False)
@@ -90,6 +106,15 @@ class Config:
     def registry_abspath(self) -> Path:
         p = Path(self.registry_path)
         return p if p.is_absolute() else (self._base_dir / p)
+
+    @property
+    def ledger_abspath(self) -> Path:
+        p = Path(self.budget.ledger_path).expanduser()
+        return p if p.is_absolute() else (self._base_dir / p)
+
+    @property
+    def project_name(self) -> str:
+        return self._base_dir.name
 
 
 def _merge_into(dc, data: dict):
