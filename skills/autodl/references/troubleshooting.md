@@ -2,6 +2,18 @@
 
 按现象查。每条都是在真实 AutoDL 实例上踩过并验证过解法的。
 
+## 账号、计费与限额（共享账号）
+
+| 现象 | 根因与解法 |
+|---|---|
+| `status --all` 显示 0 台实例，但余额在掉 | 开发者 API **只列 API 创建的 Pro 实例**，控制台手动开的容器实例永远看不到。这是别人在花钱，不是泄漏；用户自己的花费看 `autodl cost` |
+| 创建报 `RequestParameterIsWrong 请求参数错误` | 库存接口给的区域名（如 `neimengDC3`）不全被 create 接受。1.13.1 起 `--select-region` 遇此错误自动回退为不指定区域调度；老版本手动去掉 `data_center_list` 重试。参数错误的 create 不会产生实例，重试不会重复开机 |
+| 退出码 7 `个人预算: ... 已达上限` | 用户自己设的 `budget.*` 触顶，**如实报告，不要改配置绕过**。预检发生在开机/创建之前，所以此时没有产生新计费 |
+| 任务退出码 124 | `run --max-hours` 或 `budget.max_run_hours` 时限到了，被实例侧 `timeout` 终止（不会重试）。确认是真跑不完还是卡死，再决定是否放宽 |
+| 任务退出码 137 | 被 `autodl kill` 终止（或 OOM killer）。`logs --run-id` 看最后输出区分 |
+| 实例自己关机了 | 多半是 `budget.max_session_hours` 保险丝（开机时在实例内挂的 `sleep N; shutdown`，实测按时生效）。下次 `status` 会用平台关机时间自动结清账本；数据盘内容还在，`run` 会自动重新开机 |
+| 花费单价怎么核 | `status` 里的 ¥/h 来自 `payg_price`（元×1000，实测 3090 单卡 1780=¥1.78/h，与余额扣减一致）。月底用控制台账单按用户自己的实例 uuid 对一次 |
+
 ## 网络与下载
 
 | 现象 | 根因与解法 |
@@ -44,5 +56,5 @@
 - ssh 非交互 shell 不读 .bashrc：conda/pip 可能不在 PATH，脚本开头 `. /root/miniconda3/etc/profile.d/conda.sh && conda activate base`（setup 已内建此逻辑）。
 - 训练脚本用 `tee` 落日志会掩盖退出码：`set -e` + 解析步骤放 tee 之后，或检查 `PIPESTATUS`。
 - 换模型复跑前清 `output_dir`：旧 checkpoint 会被自动 resume，形状不匹配直接崩。
-- 长任务监控：交互用 `autodl logs -f`；脚本/agent 用 `until ... logs --json | jq -e '.status != "running"'; do sleep 60; done`。macOS 本地没有 `timeout` 命令（GNU coreutils），别在本地 shell 里用。
+- 长任务监控：交互用 `autodl logs -f`；脚本/agent 用 `until ... logs --json | jq -e '.status != "running"'; do sleep 60; done`。macOS 本地没有 `timeout` 命令（GNU coreutils），别在本地 shell 里用；实例上（Ubuntu 基础镜像）有，`--max-hours` 就是靠它。
 - heredoc 嵌套注意 shell 展开：单引号 heredoc（`<<'EOF'`）内 `$VAR` 不展开——python 代码里需要的路径直接写死或在 python 内定义。
