@@ -186,9 +186,9 @@ def cmd_up(ctx, args):
 
 
 def cmd_down(ctx, args):
-    uuid = ctx.reg.get_active()
+    uuid = getattr(args, "instance", None) or ctx.reg.get_active()
     if not uuid:
-        print("没有记录的活动实例。")
+        print("没有记录的活动实例（可加 --instance <uuid> 指定）。")
         return EXIT_OK
     print(f"将{'释放' if args.release else '关机'}实例 {uuid}")
     if args.dry_run:
@@ -774,8 +774,9 @@ def build_parser():
     sp.add_argument("--all", action="store_true", help="关停共享账号里所有人的实例（慎！）")
     sp = add("up", help="拉起/复用实例并打印直连信息")
     sp.add_argument("--select-region", action="store_true", help="按库存自动选区创建")
-    sp = add("down", help="关机当前活动实例")
+    sp = add("down", help="关机当前活动实例（或 --instance 指定的一台）")
     sp.add_argument("--release", action="store_true", help="释放而非仅关机")
+    sp.add_argument("--instance", help="要关的实例 uuid（默认活动实例；不会改动活动实例登记）")
     sp = add("use", help="登记一台已有实例为当前活动实例（不创建）")
     sp.add_argument("instance_uuid", help="实例 uuid，如 pro-xxxxxxxx")
     sp = add("run", help="在实例上执行任务（本地脚本/实例已有脚本/任意命令）")

@@ -15,7 +15,7 @@
 | `runs` | 本地台账运行记录（含指标，不触网）| `--limit N` |
 | `up` | 复用/新建实例+SSH免密+打印直连信息 | `--select-region` |
 | `use <uuid>` | 登记已有实例为活动实例（不创建）| |
-| `down` | 关机活动实例 | `--release`(彻底释放,慎) |
+| `down` | 关机活动实例（或指定的一台）| `--instance U` `--release`(彻底释放,慎) |
 | `stop-all` | 止损：关停**我的** running | `--release` `--all`(全账号,慎) |
 | `run` | 执行任务 | 见下 |
 | `logs` | tail 日志+状态+指标；完成时自动对账 | `--run-id` `--lines` `-f/--follow` |

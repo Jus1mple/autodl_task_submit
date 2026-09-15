@@ -361,5 +361,19 @@ st = json.loads(buf.getvalue())
 check("cli status --json 标 mine", [r["mine"] for r in st["instances"]] == [True, False] and "usage" in st, buf.getvalue()[:300])
 check("cli 退出码 7", cli.EXIT_BUDGET == 7)
 
+# cli down --instance：关指定的一台，不动活动实例登记
+ctx = mkctx()
+ctx.reg.set_active("pro-active")
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    rc = cli.cmd_down(ctx, types.SimpleNamespace(instance="pro-other", release=False, dry_run=False, yes=True, json=False))
+check("cli down --instance 关指定实例", rc == 0 and ("power_off", "pro-other") in ctx.api.calls
+      and ("power_off", "pro-active") not in ctx.api.calls, str(ctx.api.calls))
+check("cli down --instance 不改活动实例", ctx.reg.get_active() == "pro-active")
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    cli.cmd_down(ctx, types.SimpleNamespace(instance=None, release=False, dry_run=True, yes=True, json=False))
+check("cli down 默认活动实例", "pro-active" in buf.getvalue(), buf.getvalue())
+
 print("\n" + ("ALL PASS" if not FAILURES else f"{len(FAILURES)} FAILURES: {FAILURES}"))
 sys.exit(1 if FAILURES else 0)

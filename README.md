@@ -6,6 +6,8 @@ AutoDL GPU 云的 **Python 库 + 命令行工具**：开机/复用实例、传�
 
 > **本分支（web-dashboard）= `main` 核心包 + 可视化大盘**。核心（CLI/库/提交管线）的开发都在 `main`，本分支只维护 web 部分，定期 `git merge main` 吸收核心更新。只要纯依赖请用 `main` 分支 / PyPI 包。
 
+> 🚀 第一次用？看 [QUICKSTART.md](QUICKSTART.md)（傻瓜手册：照抄命令，五分钟上手）。
+>
 > 📖 完整参考手册见 [USAGE.md](USAGE.md)：安装、全部配置字段、命令参考、工作流、`--json` 契约、Python API、故障排查。
 
 ## 安装与配置
@@ -123,7 +125,7 @@ info = tasks.refresh_run(ctx, run)         # 探活/tail/完成登记/抓指标
 | `runs [--limit N]` | 列出台账运行记录（含指标，只查本地）|
 | `push <本地目录> [子目录]` | rsync 同步本地到实例数据盘 |
 | `pull <远端子路径> [本地目录]` | rsync 从实例拉回产物 |
-| `down [--release]` | 关机（或释放）当前活动实例 |
+| `down [--release] [--instance U]` | 关机（或释放）当前活动实例，或指定的一台 |
 | `snapshot-env --name N [--instance U]` | 把实例环境存为私有镜像（持续占存储费，无删除 API，慎用）|
 | `idle-guard [--once] [--idle-minutes N]` | 空闲自动关机看门狗（GPU 利用率+显存双判，keepalive 文件可豁免）|
 | `balance-watch --warn Y --stop Y` | 余额预警/急停守护（默认只关我的实例）|

@@ -138,7 +138,7 @@ env:                                # 实例环境准备（setup / run --setup�
 |---|---|
 | `autodl up [--select-region]` | 复用活动实例（关机自动开机）或新建；注入 SSH 公钥免密、写 `~/.ssh/config` 别名、打印 SSH/VSCode/Jupyter 直连信息 |
 | `autodl use <uuid>` | 登记一台**已有**实例为活动实例（不创建）|
-| `autodl down [--release]` | 关机（`--release` 则释放）活动实例；release 前轮询等真正 shutdown，失败会重试并显著告警 |
+| `autodl down [--release] [--instance U]` | 关机（`--release` 则释放）活动实例或指定的一台；release 前轮询等真正 shutdown，失败会重试并显著告警 |
 | `autodl stop-all [--release] [--all]` | **一键止损**：关停**我的** running 实例（共享账号里别人的一律跳过；`--all` 才动全账号）；单台失败不影响其余 |
 | `autodl snapshot-env --name N [--instance U] [--no-wait]` | 实例环境存为私有镜像。⚠️ AutoDL 无删除镜像 API，持续占存储费 |
 
