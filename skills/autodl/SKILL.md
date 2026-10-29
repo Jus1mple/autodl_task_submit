@@ -46,6 +46,8 @@ autodl runs --json          # run_id/状态/指标；曲线用 Python: ctx.reg.g
 - `--background` 与 `--down/--release` **互斥**（后台结束时机未知），跑完自行 down。
 - **指标约定**：任务把结果写实例的 `~/autodl-tmp/metrics.json`（顶层标量+可选 `series` 曲线），完成自动入本地台账；关机后台账数据仍在。指标为空先 `logs` 一次（会自动补抓），别急着断定丢了。
 - 跑**别人的仓库**要适配时：补丁放本地 `patches/*.patch`（git diff 生成）配 `git.patches:`，clone/sync 自动应用、绝不 push 上游。范例：仓库 `examples/vlm-r1-refcoco/`。
+- **哪些实例算用户的**：`autodl claim` 列出判定与依据。名字匹配 owner（`kedong/x`、`kedong-x`、`kedong_x`，大小写不敏感、必须有分隔符）、手动 claim、账本/台账登记过的都算；**手动 disown 优先级最高**。认不出来时 `status` 会警告"刹车是瞎的"——这时预算和并发上限都不生效，要提醒用户先 `claim`，不要替他们猜。
+- **开机报没有空闲 GPU**：实例绑定固定物理主机，按量计费不预留卡，`stock` 的区域库存不说明这台能不能开。用 `autodl grab --instance <uuid>` 守着反复试（幂等、带预算刹车、抢到自动挂保险丝），别自己写 `while` 循环硬怼 power_on。
 - 共享账号下 `status --all` 看到 0 台 ≠ 没人在用：开发者 API 只列 API 创建的 Pro 实例。退出码 124 = 任务时限到、137 = 被 kill、7 = 个人预算触顶，含义与处理见 troubleshooting「账号、计费与限额」。
 - `run --instance X` 会**顺手把 X 登记为活动实例**——探查完不属于你管的机器后，记得 `autodl use <原实例>` 切回，否则之后的裸 `down` 会关错机器。
 - 实例系统盘只有 30G（HF 缓存大户）：大任务前 `run --remote 'df -h /'` 看一眼。

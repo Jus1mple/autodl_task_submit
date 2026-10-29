@@ -9,7 +9,7 @@ from pathlib import Path
 from autodl import api, cli, cost, monitor, tasks
 from autodl.config import Config
 from autodl.core import Context
-from autodl.errors import BudgetExceeded
+from autodl.errors import AutoDLError, BudgetExceeded
 
 FAILURES = []
 
@@ -374,6 +374,235 @@ buf = io.StringIO()
 with contextlib.redirect_stdout(buf):
     cli.cmd_down(ctx, types.SimpleNamespace(instance=None, release=False, dry_run=True, yes=True, json=False))
 check("cli down 默认活动实例", "pro-active" in buf.getvalue(), buf.getvalue())
+
+
+# ---------------- grab 抢卡 ----------------
+from autodl.errors import APIError as _AE, RateLimited as _RL
+
+monitor.time.sleep = lambda *_a, **_k: None   # 测试里不真等
+
+
+class GrabAPI(StubAPI):
+    """status_seq 按轮返回状态；power_on 按 on_err 列表决定每次是失败还是成功。"""
+    def __init__(self, status_seq, on_err=()):
+        super().__init__()
+        self.status_seq, self.on_err, self.i = list(status_seq), list(on_err), 0
+        self.prices["pro-g"] = 1780
+
+    def status_or_none(self, uuid):
+        st = self.status_seq[min(self.i, len(self.status_seq) - 1)]
+        self.i += 1
+        return st
+
+    def power_on(self, uuid):
+        self.calls.append(("power_on", uuid))
+        n = sum(1 for c in self.calls if c[0] == "power_on") - 1
+        err = self.on_err[n] if n < len(self.on_err) else None
+        if err:
+            raise err
+
+
+def grabctx(status_seq, on_err=(), **budget):
+    c = mkctx(**budget)
+    c.api = GrabAPI(status_seq, on_err)
+    return c
+
+
+# 本来就开着 → 立刻成功，不发开机请求
+ctx = grabctx(["running"])
+r = monitor.grab(ctx, "pro-g", log=None)
+check("grab 已running直接成功", r["result"] == "running" and r["attempts"] == 0, str(r))
+check("grab 已running不发power_on", ("power_on", "pro-g") not in ctx.api.calls, str(ctx.api.calls))
+check("grab 成功开 session", len(ctx.ledger.open_sessions()) == 1)
+
+# 关机 → 试 2 次失败 → 第 3 次成功
+ctx = grabctx(["shutdown", "shutdown", "shutdown", "running"],
+              [_AE("x", code="ResourceIsNotEnough", msg="无可用GPU"),
+               _AE("x", code="ResourceIsNotEnough", msg="无可用GPU"), None])
+r = monitor.grab(ctx, "pro-g", interval=1, log=None)
+check("grab 重试后抢到", r["result"] == "running" and r["attempts"] == 3, str(r))
+check("grab 发了3次power_on", sum(1 for c in ctx.api.calls if c[0] == "power_on") == 3, str(ctx.api.calls))
+
+# 抢到后必须挂上 max_session_hours 保险丝（无人值守时不至于烧到天亮）
+ctx = grabctx(["shutdown", "running"], [None], max_session_hours=2)
+r = monitor.grab(ctx, "pro-g", interval=1, log=None)
+check("grab 抢到后挂保险丝", r["result"] == "running"
+      and any("sleep 7200; shutdown" in c for c in ctx.ssh.cmds), str(ctx.ssh.cmds))
+
+# 幂等：power_on 网络超时，但平台其实已执行 → 下一轮状态检查收尾，不重复开机
+ctx = grabctx(["shutdown", "running"], [_AE("请求 /power_on 网络错误: timeout")])
+r = monitor.grab(ctx, "pro-g", interval=1, log=None)
+check("grab 超时后状态检查收尾", r["result"] == "running", str(r))
+check("grab 超时不重复开机", sum(1 for c in ctx.api.calls if c[0] == "power_on") == 1, str(ctx.api.calls))
+
+# 启动中状态：不发开机请求，等它起来
+ctx = grabctx(["starting", "starting", "running"])
+r = monitor.grab(ctx, "pro-g", interval=1, log=None)
+check("grab 启动中只等待", r["result"] == "running"
+      and not [c for c in ctx.api.calls if c[0] == "power_on"], str(ctx.api.calls))
+
+# 实例没了 → 停手
+ctx = grabctx(["removed"])
+check("grab 实例已释放停手", monitor.grab(ctx, "pro-g", log=None)["result"] == "gone")
+ctx = grabctx([None])
+check("grab 实例不存在停手", monitor.grab(ctx, "pro-g", log=None)["result"] == "gone")
+
+# 预算触顶 → 一次开机请求都不发
+ctx = grabctx(["shutdown", "running"], daily_yuan=0.01)
+ctx.ledger.open_session("pro-old", 2000, started_at=NOW - H)
+ctx.ledger.close_session("pro-old", NOW)
+r = monitor.grab(ctx, "pro-g", interval=1, log=None)
+check("grab 预算触顶停手", r["result"] == "budget", str(r))
+check("grab 预算触顶不开机", not [c for c in ctx.api.calls if c[0] == "power_on"], str(ctx.api.calls))
+
+# 超时放弃
+ctx = grabctx(["shutdown"], [_AE("x", code="ResourceIsNotEnough")] * 50)
+r = monitor.grab(ctx, "pro-g", interval=1, timeout_hours=1 / 3600.0, log=None)
+check("grab 超时放弃", r["result"] == "timeout" and r["attempts"] >= 1, str(r))
+
+# 限流退避不算失败收场
+ctx = grabctx(["shutdown", "shutdown", "running"], [_RL("429", code="RateLimited"), None])
+r = monitor.grab(ctx, "pro-g", interval=1, log=None)
+check("grab 限流后继续抢", r["result"] == "running", str(r))
+
+# once 模式只试一次
+ctx = grabctx(["shutdown"], [_AE("x", code="ResourceIsNotEnough")])
+r = monitor.grab(ctx, "pro-g", once=True, log=None)
+check("grab --once 只试一次", r["result"] == "waiting" and r["attempts"] == 1, str(r))
+
+# 通知命令：抢到时带上消息
+ctx = grabctx(["running"])
+notified = {}
+real_run = monitor.subprocess.run
+monitor.subprocess.run = lambda *a, **k: notified.update(cmd=a[0], env_msg=k.get("env", {}).get("AUTODL_MSG"))
+monitor.grab(ctx, "pro-g", notify_cmd="mynotify", log=None)
+monitor.subprocess.run = real_run
+check("grab 通知带消息", "mynotify" in (notified.get("cmd") or "")
+      and "pro-g" in (notified.get("env_msg") or ""), str(notified))
+
+# 没有实例也没有活动实例 → 报错
+try:
+    monitor.grab(mkctx(), log=None); check("grab 无目标报错", False)
+except AutoDLError:
+    check("grab 无目标报错", True)
+
+# cli 接线
+ctx = grabctx(["running"])
+ctx.reg.set_active("pro-g")
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    rc = cli.cmd_grab(ctx, types.SimpleNamespace(instance=None, interval=60, timeout_hours=6.0,
+                                                 notify_cmd=None, once=False, dry_run=False, json=True))
+check("cli grab --json rc=0", rc == 0 and json.loads(buf.getvalue())["result"] == "running", buf.getvalue())
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    rc = cli.cmd_grab(ctx, types.SimpleNamespace(instance="pro-g", interval=30, timeout_hours=0,
+                                                 notify_cmd=None, once=False, dry_run=True, json=False))
+check("cli grab --dry-run 不动作", rc == 0 and "不限时" in buf.getvalue()
+      and not [c for c in ctx.api.calls if c[0] == "power_on"], buf.getvalue())
+ctx2 = mkctx()
+ctx2.reg.set_active(None)
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    rc = cli.cmd_grab(ctx2, types.SimpleNamespace(instance=None, interval=60, timeout_hours=6.0,
+                                                  notify_cmd=None, once=False, dry_run=False, json=False))
+check("cli grab 无目标 rc=2", rc == cli.EXIT_USAGE, str(rc))
+
+
+# ---------------- 认领规则（owner 匹配 + 手动 claim/disown） ----------------
+cfg1 = Config(owner="kedong")
+for nm, want in [("kedong", True), ("kedong/train", True), ("kedong-dja-rebuttal", True),
+                 ("kedong_x", True), ("kedong.x", True), ("kedong:x", True), ("kedong x", True),
+                 ("KeDong-X", True), ("  kedong/y  ", True),
+                 ("kedongxiao-test", False), ("kedong2", False), ("zedi创建", False),
+                 ("", False), ("xkedong-a", False)]:
+    check(f"name_is_mine({nm!r})={want}", cost.name_is_mine(cfg1, nm) is want)
+check("owner 空时谁都不认", not cost.name_is_mine(Config(owner=""), "kedong-x"))
+cfgl = Config(owner=["kedong", "kd"])
+check("owner 列表认多个名字", cost.name_is_mine(cfgl, "kd-foo") and cost.name_is_mine(cfgl, "kedong/bar")
+      and not cost.name_is_mine(cfgl, "zedi-x"))
+check("owner_names", cost.owner_names(cfgl) == ["kedong", "kd"] and cost.owner_names(Config()) == [])
+check("owner_prefix 取第一个", cost.owner_prefix(cfgl) == "kedong/" and cost.owner_prefix(Config()) == "")
+check("instance_name 仍带斜杠", cost.instance_name(cfgl) == "kedong/task-runner")
+
+# claim_verdict 优先级
+ctx = mkctx(owner="kedong")
+check("短名字不误匹配长名字", not cost.name_is_mine(Config(owner="kd"), "kedong-dja-rebuttal"))
+mine, why = cost.claim_verdict(ctx, {"uuid": "pro-n", "name": "kedong-dja-rebuttal"})
+check("名字匹配即我的", mine and "owner" in why, why)
+mine, why = cost.claim_verdict(ctx, {"uuid": "pro-o", "name": "zedi创建"})
+check("别人的不认", not mine and why == "无匹配", why)
+ctx.ledger.set_claim("pro-o", True)
+mine, why = cost.claim_verdict(ctx, {"uuid": "pro-o", "name": "zedi创建"})
+check("手动认领生效", mine and why == "手动认领", why)
+# 手动排除压过名字匹配（最高优先级）
+ctx.ledger.set_claim("pro-n", False)
+mine, why = cost.claim_verdict(ctx, {"uuid": "pro-n", "name": "kedong-dja-rebuttal"})
+check("手动排除压过名字匹配", not mine and "手动排除" in why, why)
+check("is_mine 与 verdict 一致", cost.is_mine(ctx, {"uuid": "pro-n", "name": "kedong-x"}) is False)
+# 排除也压过账本/台账
+ctx.ledger.adopt("pro-n", owner="kedong")
+ctx.reg.upsert_instance("pro-n", status_cached="running")
+check("手动排除压过账本和台账", not cost.is_mine(ctx, {"uuid": "pro-n", "name": ""}))
+# 恢复自动
+ctx.ledger.set_claim("pro-n", None)
+check("--auto 恢复自动判定", cost.is_mine(ctx, {"uuid": "pro-n", "name": "kedong-x"}))
+check("claims() 列出手动项", ctx.ledger.claims() == {"pro-o": True}, str(ctx.ledger.claims()))
+
+# disown 结清未结 session（不再替它累计费用）
+ctx = mkctx()
+ctx.ledger.open_session("pro-d", 2000, started_at=NOW - H)
+check("disown 前有未结 session", len(ctx.ledger.open_sessions()) == 1)
+ctx.ledger.set_claim("pro-d", False)
+check("disown 结清 session", not ctx.ledger.open_sessions())
+check("disown 后 usage 不再烧钱", cost.usage(ctx)["burn_rate"] == 0)
+
+# 旧库迁移：没有 claim 列的 owned 表要能自动补上
+import sqlite3 as _sq
+oldp = tmp / "old-ledger.db"
+_c = _sq.connect(str(oldp))
+_c.executescript("""CREATE TABLE owned (instance_uuid TEXT PRIMARY KEY, owner TEXT, name TEXT,
+ disk_gb REAL, created_at REAL, released_at REAL, last_seen REAL);
+ INSERT INTO owned(instance_uuid, owner) VALUES('pro-legacy','kedong');""")
+_c.commit(); _c.close()
+_led = cost.Ledger(oldp)
+_led.set_claim("pro-legacy", False)
+check("旧库自动补 claim 列", _led.claim_state("pro-legacy") is False)
+check("旧库数据保留", _led.owned(include_released=True)[0]["instance_uuid"] == "pro-legacy")
+
+# cli：claim 列表 / 认领 / 排除 / status 提示
+ctx = mkctx(owner="kedong")
+ctx.api.items = [item("pro-n", "kedong-dja-rebuttal"), item("pro-o", "zedi创建")]
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    rc = cli.cmd_claim(ctx, types.SimpleNamespace(instance_uuid=[], auto=False, json=True))
+cl = json.loads(buf.getvalue())
+check("cli claim --json 列判定", rc == 0 and [r["mine"] for r in cl["instances"]] == [True, False]
+      and cl["owner"] == ["kedong"], buf.getvalue()[:200])
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    cli.cmd_claim(ctx, types.SimpleNamespace(instance_uuid=[], auto=False, json=False))
+check("cli claim 文本带依据", "我" in buf.getvalue() and "他" in buf.getvalue()
+      and "无匹配" in buf.getvalue(), buf.getvalue()[:300])
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    rc = cli.cmd_claim(ctx, types.SimpleNamespace(instance_uuid=["pro-o"], auto=False, json=False))
+check("cli claim 认领", rc == 0 and ctx.ledger.claim_state("pro-o") is True)
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    rc = cli.cmd_disown(ctx, types.SimpleNamespace(instance_uuid=["pro-o"], json=False))
+check("cli disown 排除", rc == 0 and ctx.ledger.claim_state("pro-o") is False)
+with contextlib.redirect_stdout(io.StringIO()):
+    cli.cmd_claim(ctx, types.SimpleNamespace(instance_uuid=["pro-o"], auto=True, json=False))
+check("cli claim --auto 清除", ctx.ledger.claim_state("pro-o") is None)
+# status：一台都没认出来时给提示
+ctx2 = mkctx(owner="nobody")
+ctx2.api.items = [item("pro-x", "someone-else")]
+ctx2.api.balance_yuan = lambda: 100.0
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    cli.cmd_status(ctx2, types.SimpleNamespace(json=False, all=True))
+check("status 认不出时提示", "刹车现在是瞎的" in buf.getvalue(), buf.getvalue()[:300])
 
 print("\n" + ("ALL PASS" if not FAILURES else f"{len(FAILURES)} FAILURES: {FAILURES}"))
 sys.exit(1 if FAILURES else 0)

@@ -79,7 +79,10 @@ class BudgetConfig:
 @dataclass
 class Config:
     base_url: str = "https://api.autodl.com"
-    owner: str = ""                  # 我的标识：新建实例名加 "<owner>/" 前缀，止损/记账只认带前缀或台账登记的实例
+    owner: str = ""                  # 我的标识：新建实例名加 "<owner>/" 前缀；认领时 kedong/x、
+                                     # kedong-x、kedong_x 都算我的（大小写不敏感，但必须有分隔符，
+                                     # 所以不会误认 kedongxiao-test）。可写列表认多个名字：
+                                     # owner: [kedong, kd]。名字不守规矩的用 `autodl claim <uuid>`。
     image_uuid: str = "base-image-12be412037"
     gpu_spec_uuid: str = "v-48g"
     cuda_v_from: int = 111

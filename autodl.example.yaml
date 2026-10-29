@@ -22,8 +22,13 @@ gpu_stock_name: vGPU-48GB                  # 库存里对应 v-48g 的型号名
 min_balance_yuan: 10.0               # 账户余额低于此值则中止开机（共享账号下只是兜底，真正约束我的是 budget）
 
 # 共享账号：只算"我自己"的账、只限制"我自己"（详见 USAGE.md §11）
-owner: ""                            # 我的标识，如 kedong：新建实例名带 "kedong/" 前缀；
-                                     # status/stop-all/守护默认只认带前缀或本地登记过的实例
+owner: ""                            # 我的标识，如 kedong。新建实例名带 "kedong/" 前缀；认领时
+                                     # kedong/x、kedong-x、kedong_x、kedong.x 都算我的（大小写不
+                                     # 敏感，但必须有分隔符，不会误认 kedongxiao-test）。
+                                     # 可写列表认多个名字：owner: [kedong, kd]。
+                                     # 名字不守规矩的实例：autodl claim <uuid> 手动认领，
+                                     # autodl disown <uuid> 手动排除（排除优先级最高）。
+                                     # 跑 `autodl claim` 看每台实例的判定与依据。
 budget:                              # 0 = 不限。费用口径 = 我开机时段 × 实例小时价（与官方按秒计费一致）
   daily_yuan: 0                      # 今日我的花费上限（触顶拒绝开机/提交，退出码 7）
   weekly_yuan: 0
