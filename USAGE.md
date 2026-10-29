@@ -196,6 +196,7 @@ autodl batch --file jobs.yaml [--max-parallel N] [--on-finish release|power_off|
 |---|---|
 | `autodl idle-guard [--idle-minutes 15] [--once]` | 空闲自动关机看门狗（GPU 利用率 + 显存双判；实例上 `touch /root/.autodl_keepalive` 豁免；SSH 不通绝不误判为空闲）|
 | `autodl balance-watch --warn 50 --stop 10 [--stop-mode mine\|active\|stop_all]` | 账户余额预警/急停；默认 `mine` 只关我的实例 |
+| `autodl grab [--instance U] [--interval 60] [--timeout-hours 6] [--notify-cmd CMD] [--once]` | **抢卡**：守着一台关机实例反复试开机，等宿主机空出 GPU（§12）|
 | `autodl budget-guard [--interval 300] [--once]` | **个人预算守护**：今日/本周/本月花费触顶 → 关停我的全部 running；某台连续开机超 `max_session_hours` → 只关那台。绝不碰别人的（§11）|
 
 ### 退出码
@@ -206,6 +207,7 @@ autodl batch --file jobs.yaml [--max-parallel N] [--on-finish release|power_off|
 | 1 | 其它错误（API/IO）|
 | 2 | 用法/配置错误 |
 | 3 | 余额低于 `min_balance_yuan` |
+| 4 | 无库存；`grab` 超时放弃 |
 | 5 | SSH 不可达 |
 | 7 | 个人预算/配额触顶（`budget.*`）|
 | 6 | 远端任务非零退出 |
@@ -292,6 +294,7 @@ autodl balance-watch --warn 50 --stop 10 &     # 余额告警/急停
 | `status` | `balance_yuan, instances: [{instance_uuid, name, status, billing, region, active, mine}], usage: {today, week, month, disk_month, burn_rate, running, sessions_open}` |
 | `cost` | `rows: [...], total, disk, since, until, usage`（rows 字段随 `--by` 变化）|
 | `kill` | `run_id, killed, state, note` |
+| `grab` | `result (running\|timeout\|gone\|budget\|waiting\|interrupted), instance, attempts, waited, note` |
 | `clone` | `dir, branch, head, created, credentials, patches` |
 | `sync` | `dir, branch, mode, old, new, updated, dirty, blocked, error, message, patches` |
 | `setup` | `skipped, source, command, exit_code`（或后台句柄）|
@@ -392,3 +395,34 @@ autodl budget-guard --interval 300 & # 守护
 ```
 
 精度边界（诚实说明）：这是**归属估算**，不是发票。单价按开机时快照，平台改价不追；代金券/折扣变动看不到；别人用我的实例也会算到我头上（所以要贴 owner 前缀）；`payg_price` 单位文档未明示，按"元×1000"处理——已实测：3090 单卡 `payg_price=1780` 即 ¥1.78/h，一段 0.05h 的 session 记 ¥0.09，账户余额同时刻恰好减少 ¥0.09。月底用控制台账单按我的实例 uuid 筛一遍对账即可。
+
+## 12. 抢卡：等宿主机空出 GPU
+
+实例绑定固定物理主机（官方 FAQ：「同一个实例中的多卡在同一物理主机上」，按量计费**不预留** GPU），所以关机的实例想开机时，宿主机的卡可能已经被别人占满。`autodl stock` 查的是**区域级**库存，区域里有空闲卡不代表你那台宿主机有——这台能不能开，只有直接试开机才知道。`grab` 就是替你反复试。
+
+```bash
+autodl grab --instance pro-xxxx                  # 每 60s 试一次，最多等 6h，抢到即止
+autodl grab --instance pro-xxxx --timeout-hours 0   # 一直等
+autodl grab --instance pro-xxxx --once           # 只试一次（挂 cron 用）
+autodl grab --instance pro-xxxx && autodl run --remote-script ~/train.sh --background
+```
+
+| 参数 | 说明 |
+|---|---|
+| `--instance U` | 要抢的实例 uuid（默认活动实例）|
+| `--interval N` | 每隔多少秒试一次，默认 60。被限流(429)时自动指数退避到最多 600s |
+| `--timeout-hours H` | 最多等多少小时，默认 6；`0` = 一直等 |
+| `--notify-cmd CMD` | 抢到/超时/预算触顶时执行；消息同时作为参数和 `$AUTODL_MSG` 传入 |
+| `--once` | 只试一次就返回（巡检/cron）|
+
+**为什么是安全的**
+
+- **开机幂等**：每轮先查状态再决定动作。某次开机请求网络超时、而平台其实已经执行，下一轮的状态查询会看到 `running` 并正常收尾——绝不会重复开机重复计费。这与「写接口绝不自动重试」的铁律并不冲突：重试的前提是先确认当前状态。
+- **抢到即上保险**：成功的那一刻就记一条 session 并挂上 `budget.max_session_hours` 的实例侧关机定时器，所以半夜抢到卡也不会烧到天亮。强烈建议配 `max_session_hours` 再用 `grab`。
+- **预算刹车**：每次尝试前过 `budget.*`；等待期间预算被别的任务吃光就停手（退出码 7）。
+- **不空转**：所有「本轮没抢到」的分支都汇到同一个出口，统一判超时和 `--once`；实例被释放则立即停手（退出码 1）。
+- **抖动**：轮询间隔带 ±10% 随机抖动，多个 `grab` 进程不会同步撞在一起。
+
+**退出码**：0 抢到（或本来就开着）/ 4 超时放弃、`--once` 没抢到 / 7 预算触顶 / 1 实例已不存在。
+
+**不覆盖的场景**：手上没有实例、想等有货再新建的「抢新机」。那种情况 `autodl stock` 的区域库存是有意义的，但本命令不做——它只负责把**你指定的那台已有实例**开起来。

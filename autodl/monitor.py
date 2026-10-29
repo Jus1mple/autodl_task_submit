@@ -1,4 +1,4 @@
-"""守护：空闲自动关机看门狗 + 余额预警/急停。
+"""守护：空闲自动关机看门狗 + 余额预警/急停 + 抢卡等待。
 
 AutoDL 没有官方空闲关机开关、没有 webhook，这里靠客户端轮询补上。
 关键安全点（来自评审）：
@@ -9,12 +9,22 @@ AutoDL 没有官方空闲关机开关、没有 webhook，这里靠客户端轮�
 """
 from __future__ import annotations
 
+import os
+import random
+import subprocess
 import time
 
 from . import cost
-from .errors import APIError, SSHUnavailable
+from .errors import APIError, AutoDLError, BudgetExceeded, RateLimited, SSHUnavailable
 
 DEFAULT_KEEPALIVE = "/root/.autodl_keepalive"
+
+# grab 用的状态集合（与 core 一致，这里独立列出避免循环 import）
+_GRAB_BOOTING = ("starting", "sys_volume_creating", "shutting_down", "creating")
+_GRAB_OFF = ("shutdown", "power_off")
+_BOOT_POLL = 5        # 实例正在启动/关闭时的快轮询间隔（秒）
+_MAX_BACKOFF = 600    # 被限流时的最大退避（秒）
+_CONFIRM_TRIES = 24   # 发过开机请求后，最多等 24×5s=2min 确认实例真的起来
 
 
 def _probe_idle(ctx, snapshot, uuid, keepalive_path, util_threshold, mem_threshold_mib):
@@ -201,3 +211,177 @@ def budget_guard(ctx, interval=300, once=False, notify=None, log=print):
         if long_sessions:
             return "session_limit"
         time.sleep(interval)
+
+
+
+# ---------------- 抢卡：等宿主机空出 GPU ----------------
+def _q(s):
+    return "'" + str(s).replace("'", "'\\''") + "'"
+
+
+def _notify(cmd, msg, log=None):
+    """把消息交给用户自己配的命令（飞书 webhook / osascript / say 都行）。
+    消息同时作为参数和环境变量 AUTODL_MSG 传入。失败只告警，绝不影响抢卡。"""
+    if not cmd:
+        return
+    try:
+        subprocess.run(f"{cmd} {_q(msg)}", shell=True,
+                       env={**os.environ, "AUTODL_MSG": msg}, timeout=30, check=False)
+    except Exception as e:  # noqa: BLE001 - 通知失败不该影响主流程
+        if log:
+            log(f"  ⚠️ 通知命令失败: {e}")
+
+
+def _hm(seconds):
+    """秒 → '45s' / '12m' / '3h05m'，日志用。"""
+    seconds = int(seconds)
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m"
+    return f"{seconds // 3600}h{(seconds % 3600) // 60:02d}m"
+
+
+def _await_running(ctx, uuid, tries=_CONFIRM_TRIES, interval=_BOOT_POLL):
+    """轮询到实例 running、或明确停在某个非过渡态、或次数用尽。返回最后看到的状态。
+    用于两处：发过开机请求后确认是否真起来了；进来时实例正好在启动中。"""
+    st = None
+    for i in range(max(1, tries)):
+        st = ctx.api.status_or_none(uuid)
+        if st == "running" or st in (None, "removed") or st in _GRAB_OFF:
+            return st
+        if i + 1 < tries:
+            time.sleep(interval)
+    return st
+
+
+def grab(ctx, instance_uuid=None, interval=60, timeout_hours=6.0, notify_cmd=None,
+         once=False, log=print):
+    """守在一台**已有**实例上，等它的宿主机空出 GPU 就开机（抢卡）。
+
+    为什么不看 gpu_stock：库存接口是**区域级**的，而实例绑定固定物理主机（官方 FAQ：
+    "同一个实例中的多卡在同一物理主机上"；按量计费不预留 GPU）。区域里有空闲卡 ≠ 你那台
+    宿主机有空闲卡，所以这台机器现在能不能开，只有直接试开机才知道。
+
+    安全设计——**每轮先查状态，再决定动作**：
+    - power_on 因此是幂等的。上一轮的 power_on 即使网络超时、而平台其实已经执行，
+      这一轮的状态查询也会看到 running 并正常收尾，绝不会重复开机重复计费。
+    - 抢到立刻走 cost.on_power_on：记一条 session + 挂上 max_session_hours 保险丝，
+      无人值守时抢到卡也不会一直空烧。
+    - 每次尝试前过个人预算；等待期间预算被别的任务吃光就停手，不会抢到一台付不起的卡。
+    - 所有"本轮没抢到"的分支都汇到同一个出口，统一判超时 / --once，不会空转。
+
+    返回 {result, instance, attempts, waited, note}；result 取值：
+      running（抢到，或本来就开着）| timeout（超时放弃）| gone（实例已不存在）|
+      budget（预算触顶）| waiting（--once 本轮没抢到）| interrupted（Ctrl-C）
+    """
+    uuid = instance_uuid or ctx.reg.get_active()
+    if not uuid:
+        raise AutoDLError("没有指定实例，也没有活动实例：用 --instance <uuid> 指定要抢哪一台")
+    start = time.time()
+    deadline = (start + timeout_hours * 3600) if timeout_hours and timeout_hours > 0 else None
+    attempt, issued, wait = 0, False, interval
+    out = {"instance": uuid, "attempts": 0, "waited": 0.0, "note": ""}
+
+    def done(result, note=""):
+        out.update(result=result, attempts=attempt,
+                   waited=round(time.time() - start, 1), note=note)
+        return out
+
+    if log:
+        log(f"抢卡 {uuid}：等宿主机空出 GPU（每 {interval}s 试一次，"
+            + (f"最多等 {timeout_hours:g}h）" if deadline else "不限时）"))
+        log("  实例绑定固定物理主机，区域库存有卡也不代表这台能开，只能直接试。Ctrl-C 可随时停。")
+    try:
+        while True:
+            if deadline and time.time() >= deadline:
+                if log:
+                    log(f"✗ 等满 {timeout_hours:g}h 仍没抢到，放弃。")
+                _notify(notify_cmd, f"抢卡超时放弃：{uuid}（等了 {_hm(time.time() - start)}）", log)
+                return done("timeout", out["note"])
+
+            st = ctx.api.status_or_none(uuid)
+
+            if st == "running":
+                snap = None
+                try:
+                    snap = ctx.api.snapshot(uuid)
+                except APIError:
+                    pass
+                cost.on_power_on(ctx, uuid, snap, "grab" if issued else "adopt", log=log)
+                ctx.reg.upsert_instance(uuid, status_cached="running")
+                msg = (f"抢到卡了：{uuid} 已开机"
+                       + (f"（等了 {_hm(time.time() - start)}，试了 {attempt} 次）"
+                          if issued else "（本来就开着）"))
+                if log:
+                    log("\a✓ " + msg)
+                    log(f"  用完记得关：autodl down --instance {uuid}")
+                _notify(notify_cmd, msg, log)
+                return done("running")
+
+            if st in (None, "removed"):
+                if log:
+                    log(f"✗ 实例 {uuid} 不存在或已释放，停止抢卡。")
+                return done("gone", f"实例状态 {st}")
+
+            if st in _GRAB_BOOTING:
+                # 正在启动/关闭：不插手，等它稳定下来
+                st2 = _await_running(ctx, uuid)
+                if st2 == "running":
+                    continue                      # 回到顶部走成功分支
+                if st2 in (None, "removed"):
+                    if log:
+                        log(f"✗ 实例 {uuid} 已消失，停止抢卡。")
+                    return done("gone", f"实例状态 {st2}")
+                reason = f"过渡态未落定（{st} → {st2}）"
+
+            elif st in _GRAB_OFF:
+                attempt += 1
+                try:
+                    cost.check_budget(ctx, price=ctx._price_of(uuid), new_instance=True,
+                                      reconcile_first=(attempt == 1), log=None)
+                except BudgetExceeded as e:
+                    if log:
+                        log(f"✗ 个人预算触顶，停止抢卡：{e}")
+                    _notify(notify_cmd, f"抢卡停止（预算触顶）：{uuid}", log)
+                    return done("budget", str(e))
+                try:
+                    ctx.api.power_on(uuid)
+                except RateLimited:
+                    reason = "被限流(429)"
+                    wait = min(max(wait, interval) * 2, _MAX_BACKOFF)
+                except APIError as e:
+                    # 业务错误（多半就是宿主机没空闲 GPU）或网络错误：都不在这里重试。
+                    # 下一轮顶部的状态查询会顺带覆盖"请求其实已送达并生效"的情况。
+                    reason = (f"{e.code or ''} {e.msg or ''}".strip() or str(e))[:120]
+                    wait = interval
+                else:
+                    issued = True
+                    wait = interval
+                    if log:
+                        log(f"  [{attempt}] 开机请求已受理，确认中…")
+                    st2 = _await_running(ctx, uuid)
+                    if st2 == "running":
+                        continue                  # 回到顶部走成功分支
+                    reason = f"开机请求受理了，但实例仍是 {st2}"
+            else:
+                reason = f"未知状态 {st}"
+
+            # —— 本轮没抢到：统一出口 ——
+            out["note"] = reason
+            if log:
+                log(f"  [{attempt}] 没抢到：{reason} —— 已等 {_hm(time.time() - start)}")
+            if once:
+                return done("waiting", reason)
+            if deadline and time.time() + wait >= deadline:
+                if log:
+                    log(f"✗ 等满 {timeout_hours:g}h 仍没抢到，放弃。")
+                _notify(notify_cmd, f"抢卡超时放弃：{uuid}（等了 {_hm(time.time() - start)}）", log)
+                return done("timeout", reason)
+            time.sleep(wait * random.uniform(0.9, 1.1))   # 抖动，避免多进程同步轮询
+    except KeyboardInterrupt:
+        if log:
+            log("\n已停止抢卡。")
+            if issued:
+                log("  ⚠️ 期间发过开机请求，确认一下是否真的开起来了：autodl status")
+        return done("interrupted")

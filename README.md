@@ -116,6 +116,7 @@ info = tasks.refresh_run(ctx, run)         # 探活/tail/完成登记/抓指标
 | `idle-guard [--once] [--idle-minutes N]` | 空闲自动关机看门狗（GPU 利用率+显存双判，keepalive 文件可豁免）|
 | `balance-watch --warn Y --stop Y` | 余额预警/急停守护（默认只关我的实例）|
 | `budget-guard [--once]` | 个人预算/开机时长守护：触顶只关我的实例 |
+| `grab [--instance U]` | **抢卡**：守着一台关机实例，等宿主机空出 GPU 就开机 |
 | `batch --file jobs.yaml [--max-parallel N]` | 批量并行调度：多实例跑多任务，记 run 台账、支持 resume |
 
 通用参数放在命令**后面**：`--config`、`--dry-run`、`--yes/-y`、`--json`。
@@ -225,6 +226,22 @@ autodl idle-guard --instance pro-xxxx --idle-minutes 15
 autodl balance-watch --warn 50 --stop 10 --interval 300
 ```
 两者都靠客户端轮询实现（AutoDL 无空闲关机开关、无 webhook）。SSH 连不上时看门狗会回退查实例状态，**绝不把"网络不通"误判成"空闲"而误关**。
+
+## 抢卡：等宿主机空出 GPU
+
+实例绑定固定物理主机（官方 FAQ：「同一个实例中的多卡在同一物理主机上」，按量计费**不预留** GPU），所以关机的实例想开机时，宿主机的卡可能已经被别人占满。`autodl stock` 查的是**区域级**库存，区域里有空闲卡不代表你那台宿主机有——这台能不能开，只有直接试开机才知道。`grab` 就是替你反复试。
+
+```bash
+autodl grab --instance pro-xxxx                       # 每 60s 试一次，最多等 6h
+autodl grab --instance pro-xxxx --timeout-hours 0 \
+            --notify-cmd 'osascript -e "display notification \"$AUTODL_MSG\""'
+autodl grab --instance pro-xxxx && autodl run --remote-script ~/train.sh --background
+```
+
+- **每轮先查状态再动作**，所以开机请求是幂等的：某次请求网络超时但平台其实已执行，下一轮状态查询会发现实例已经 running 并正常收尾，绝不会重复开机重复计费。
+- 抢到立刻记一条 session 并挂上 `budget.max_session_hours` 保险丝——无人值守抢到卡也不会一直空烧。
+- 每次尝试前过个人预算；等待期间预算被别的任务吃光就停手。
+- 退出码：0 抢到 / 4 超时放弃 / 7 预算触顶 / 1 实例已不存在。配合 `&&` 就能"抢到就开跑"。
 
 ## 共享账号：只算我的账、只限我自己
 

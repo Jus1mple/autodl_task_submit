@@ -129,6 +129,18 @@ autodl run --script eval.sh --down
 autodl run --script train.sh --background --dry-run
 ```
 
+**没卡开不了机，让它替你等**（抢到会响一声并自动挂上关机保险丝）
+
+```bash
+autodl grab --instance pro-xxxx
+```
+
+想抢到就直接开跑：
+
+```bash
+autodl grab --instance pro-xxxx && autodl run --script train.sh --background --name exp1
+```
+
 **任务跑飞了，停掉它**
 
 ```bash
@@ -238,6 +250,7 @@ autodl run --remote '命令' --down                  跑完就关
 autodl logs -f                实时看进度
 autodl logs --run-id N        看某个任务
 autodl kill --run-id N        停掉任务
+autodl grab --instance U      没卡时守着等，抢到就开机
 autodl down                   关机（保留环境）
 autodl cost                   花费报表
 加 --dry-run                  只预览不执行

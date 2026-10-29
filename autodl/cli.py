@@ -12,6 +12,7 @@
   setup [--force]      按仓库依赖声明准备环境（hash 幂等，未变秒跳）
   logs [--run-id R]    查看后台任务日志 + 退出码 + 指标
   kill [--run-id R]    终止后台任务（kill 进程组）
+  grab [--instance U]  抢卡：守着一台关机实例，等宿主机空出 GPU 就开机
   runs [--limit N]     列出台账里的运行记录（含指标）
   cost [--since 7d]    我的花费报表（共享账号下只算我开机的时段）
   budget-guard         个人预算/会话时长守护（只关我的实例）
@@ -20,7 +21,8 @@
 
 全局：--config 指定配置文件；--dry-run 仅预览破坏性动作；--yes 跳过确认；--json 机器可读。
 --json 时 stdout 只输出 JSON（进度日志走 stderr），可以直接 `| jq` / 被脚本消费。
-退出码：0 成功；2 用法错误；3 余额不足；4 无库存；5 SSH 不可达；6 任务非零退出；7 个人预算触顶；1 其它。
+退出码：0 成功；2 用法错误；3 余额不足；4 无库存/抢卡超时；5 SSH 不可达；6 任务非零退出；
+7 个人预算触顶；1 其它。
 """
 from __future__ import annotations
 
@@ -590,6 +592,31 @@ def cmd_cost(ctx, args):
     return EXIT_OK
 
 
+def cmd_grab(ctx, args):
+    """抢卡：守着指定实例，等它的宿主机空出 GPU 就开机。"""
+    uuid = args.instance or ctx.reg.get_active()
+    if not uuid:
+        print("没有指定实例：用 --instance <uuid> 指定要抢哪一台（autodl status 看有哪些）。",
+              file=sys.stderr)
+        return EXIT_USAGE
+    if not ctx.cfg.owner:
+        _eprint("提示：autodl.yaml 没配 owner，预算/并发刹车认不出你已有的实例，抢卡期间不会拦你。")
+    if args.dry_run:
+        limit = f"最多 {args.timeout_hours:g}h" if args.timeout_hours > 0 else "不限时"
+        print(f"[dry-run] 将守着 {uuid}，每 {args.interval}s 试一次开机（{limit}）")
+        print(f"[dry-run] 抢到后挂 {ctx.cfg.budget.max_session_hours or 0:g}h 保险丝（budget.max_session_hours）")
+        print("[dry-run] 未执行任何操作。")
+        return EXIT_OK
+    res = monitor.grab(ctx, instance_uuid=uuid, interval=args.interval,
+                       timeout_hours=args.timeout_hours, notify_cmd=args.notify_cmd,
+                       once=args.once, log=_eprint if args.json else print)
+    if args.json:
+        print(json.dumps(res, ensure_ascii=False))
+    code = {"running": EXIT_OK, "timeout": EXIT_STOCK, "budget": EXIT_BUDGET,
+            "gone": EXIT_ERR, "waiting": EXIT_STOCK, "interrupted": EXIT_OK}
+    return code.get(res["result"], EXIT_ERR)
+
+
 def cmd_budget_guard(ctx, args):
     res = monitor.budget_guard(ctx, interval=args.interval, once=args.once)
     print(f"budget-guard 结束: {res}")
@@ -819,6 +846,13 @@ def build_parser():
     sp.add_argument("--since", default="month", help="起点：7d / 24h / 2w / today / week / month(默认) / YYYY-MM-DD")
     sp.add_argument("--by", choices=["day", "instance", "session", "run"], default="day", help="汇总维度")
     sp.add_argument("--offline", action="store_true", help="不触网对账，只看本地账本")
+    sp = add("grab", help="抢卡：守着一台关机实例，等宿主机空出 GPU 就开机")
+    sp.add_argument("--instance", help="要抢的实例 uuid（默认活动实例）")
+    sp.add_argument("--interval", type=int, default=60, help="每隔多少秒试一次（默认 60）")
+    sp.add_argument("--timeout-hours", type=float, default=6.0,
+                    help="最多等多少小时就放弃（默认 6；0=一直等）")
+    sp.add_argument("--notify-cmd", help="抢到/放弃时执行的命令，消息作为参数和 $AUTODL_MSG 传入")
+    sp.add_argument("--once", action="store_true", help="只试一次（巡检/挂 cron 用）")
     sp = add("budget-guard", help="个人预算/会话时长守护：触顶只关我的实例")
     sp.add_argument("--interval", type=int, default=300, help="轮询间隔(秒)")
     sp.add_argument("--once", action="store_true", help="只判一次不动作")
@@ -868,7 +902,7 @@ _DISPATCH = {
     "patch": cmd_patch, "setup": cmd_setup, "push": cmd_push, "pull": cmd_pull,
     "snapshot-env": cmd_snapshot_env, "idle-guard": cmd_idle_guard,
     "balance-watch": cmd_balance_watch, "batch": cmd_batch,
-    "kill": cmd_kill, "cost": cmd_cost, "budget-guard": cmd_budget_guard,
+    "kill": cmd_kill, "cost": cmd_cost, "budget-guard": cmd_budget_guard, "grab": cmd_grab,
 }
 
 

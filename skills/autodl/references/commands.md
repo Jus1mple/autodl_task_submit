@@ -30,6 +30,7 @@
 | `idle-guard` | 空闲自动关机看门狗 | `--idle-minutes` `--once` |
 | `balance-watch` | 账户余额预警/急停（默认只关我的）| `--warn` `--stop` `--stop-mode mine\|active\|stop_all` |
 | `budget-guard` | 个人预算/开机时长守护（只关我的）| `--interval` `--once` |
+| `grab` | 抢卡：守着一台关机实例等宿主机空出 GPU | `--instance U` `--interval 60` `--timeout-hours 6`(0=不限) `--notify-cmd` `--once` |
 
 ## run 详解
 

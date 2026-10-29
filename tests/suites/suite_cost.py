@@ -9,7 +9,7 @@ from pathlib import Path
 from autodl import api, cli, cost, monitor, tasks
 from autodl.config import Config
 from autodl.core import Context
-from autodl.errors import BudgetExceeded
+from autodl.errors import AutoDLError, BudgetExceeded
 
 FAILURES = []
 
@@ -374,6 +374,139 @@ buf = io.StringIO()
 with contextlib.redirect_stdout(buf):
     cli.cmd_down(ctx, types.SimpleNamespace(instance=None, release=False, dry_run=True, yes=True, json=False))
 check("cli down 默认活动实例", "pro-active" in buf.getvalue(), buf.getvalue())
+
+
+# ---------------- grab 抢卡 ----------------
+from autodl.errors import APIError as _AE, RateLimited as _RL
+
+monitor.time.sleep = lambda *_a, **_k: None   # 测试里不真等
+
+
+class GrabAPI(StubAPI):
+    """status_seq 按轮返回状态；power_on 按 on_err 列表决定每次是失败还是成功。"""
+    def __init__(self, status_seq, on_err=()):
+        super().__init__()
+        self.status_seq, self.on_err, self.i = list(status_seq), list(on_err), 0
+        self.prices["pro-g"] = 1780
+
+    def status_or_none(self, uuid):
+        st = self.status_seq[min(self.i, len(self.status_seq) - 1)]
+        self.i += 1
+        return st
+
+    def power_on(self, uuid):
+        self.calls.append(("power_on", uuid))
+        n = sum(1 for c in self.calls if c[0] == "power_on") - 1
+        err = self.on_err[n] if n < len(self.on_err) else None
+        if err:
+            raise err
+
+
+def grabctx(status_seq, on_err=(), **budget):
+    c = mkctx(**budget)
+    c.api = GrabAPI(status_seq, on_err)
+    return c
+
+
+# 本来就开着 → 立刻成功，不发开机请求
+ctx = grabctx(["running"])
+r = monitor.grab(ctx, "pro-g", log=None)
+check("grab 已running直接成功", r["result"] == "running" and r["attempts"] == 0, str(r))
+check("grab 已running不发power_on", ("power_on", "pro-g") not in ctx.api.calls, str(ctx.api.calls))
+check("grab 成功开 session", len(ctx.ledger.open_sessions()) == 1)
+
+# 关机 → 试 2 次失败 → 第 3 次成功
+ctx = grabctx(["shutdown", "shutdown", "shutdown", "running"],
+              [_AE("x", code="ResourceIsNotEnough", msg="无可用GPU"),
+               _AE("x", code="ResourceIsNotEnough", msg="无可用GPU"), None])
+r = monitor.grab(ctx, "pro-g", interval=1, log=None)
+check("grab 重试后抢到", r["result"] == "running" and r["attempts"] == 3, str(r))
+check("grab 发了3次power_on", sum(1 for c in ctx.api.calls if c[0] == "power_on") == 3, str(ctx.api.calls))
+
+# 抢到后必须挂上 max_session_hours 保险丝（无人值守时不至于烧到天亮）
+ctx = grabctx(["shutdown", "running"], [None], max_session_hours=2)
+r = monitor.grab(ctx, "pro-g", interval=1, log=None)
+check("grab 抢到后挂保险丝", r["result"] == "running"
+      and any("sleep 7200; shutdown" in c for c in ctx.ssh.cmds), str(ctx.ssh.cmds))
+
+# 幂等：power_on 网络超时，但平台其实已执行 → 下一轮状态检查收尾，不重复开机
+ctx = grabctx(["shutdown", "running"], [_AE("请求 /power_on 网络错误: timeout")])
+r = monitor.grab(ctx, "pro-g", interval=1, log=None)
+check("grab 超时后状态检查收尾", r["result"] == "running", str(r))
+check("grab 超时不重复开机", sum(1 for c in ctx.api.calls if c[0] == "power_on") == 1, str(ctx.api.calls))
+
+# 启动中状态：不发开机请求，等它起来
+ctx = grabctx(["starting", "starting", "running"])
+r = monitor.grab(ctx, "pro-g", interval=1, log=None)
+check("grab 启动中只等待", r["result"] == "running"
+      and not [c for c in ctx.api.calls if c[0] == "power_on"], str(ctx.api.calls))
+
+# 实例没了 → 停手
+ctx = grabctx(["removed"])
+check("grab 实例已释放停手", monitor.grab(ctx, "pro-g", log=None)["result"] == "gone")
+ctx = grabctx([None])
+check("grab 实例不存在停手", monitor.grab(ctx, "pro-g", log=None)["result"] == "gone")
+
+# 预算触顶 → 一次开机请求都不发
+ctx = grabctx(["shutdown", "running"], daily_yuan=0.01)
+ctx.ledger.open_session("pro-old", 2000, started_at=NOW - H)
+ctx.ledger.close_session("pro-old", NOW)
+r = monitor.grab(ctx, "pro-g", interval=1, log=None)
+check("grab 预算触顶停手", r["result"] == "budget", str(r))
+check("grab 预算触顶不开机", not [c for c in ctx.api.calls if c[0] == "power_on"], str(ctx.api.calls))
+
+# 超时放弃
+ctx = grabctx(["shutdown"], [_AE("x", code="ResourceIsNotEnough")] * 50)
+r = monitor.grab(ctx, "pro-g", interval=1, timeout_hours=1 / 3600.0, log=None)
+check("grab 超时放弃", r["result"] == "timeout" and r["attempts"] >= 1, str(r))
+
+# 限流退避不算失败收场
+ctx = grabctx(["shutdown", "shutdown", "running"], [_RL("429", code="RateLimited"), None])
+r = monitor.grab(ctx, "pro-g", interval=1, log=None)
+check("grab 限流后继续抢", r["result"] == "running", str(r))
+
+# once 模式只试一次
+ctx = grabctx(["shutdown"], [_AE("x", code="ResourceIsNotEnough")])
+r = monitor.grab(ctx, "pro-g", once=True, log=None)
+check("grab --once 只试一次", r["result"] == "waiting" and r["attempts"] == 1, str(r))
+
+# 通知命令：抢到时带上消息
+ctx = grabctx(["running"])
+notified = {}
+real_run = monitor.subprocess.run
+monitor.subprocess.run = lambda *a, **k: notified.update(cmd=a[0], env_msg=k.get("env", {}).get("AUTODL_MSG"))
+monitor.grab(ctx, "pro-g", notify_cmd="mynotify", log=None)
+monitor.subprocess.run = real_run
+check("grab 通知带消息", "mynotify" in (notified.get("cmd") or "")
+      and "pro-g" in (notified.get("env_msg") or ""), str(notified))
+
+# 没有实例也没有活动实例 → 报错
+try:
+    monitor.grab(mkctx(), log=None); check("grab 无目标报错", False)
+except AutoDLError:
+    check("grab 无目标报错", True)
+
+# cli 接线
+ctx = grabctx(["running"])
+ctx.reg.set_active("pro-g")
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    rc = cli.cmd_grab(ctx, types.SimpleNamespace(instance=None, interval=60, timeout_hours=6.0,
+                                                 notify_cmd=None, once=False, dry_run=False, json=True))
+check("cli grab --json rc=0", rc == 0 and json.loads(buf.getvalue())["result"] == "running", buf.getvalue())
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    rc = cli.cmd_grab(ctx, types.SimpleNamespace(instance="pro-g", interval=30, timeout_hours=0,
+                                                 notify_cmd=None, once=False, dry_run=True, json=False))
+check("cli grab --dry-run 不动作", rc == 0 and "不限时" in buf.getvalue()
+      and not [c for c in ctx.api.calls if c[0] == "power_on"], buf.getvalue())
+ctx2 = mkctx()
+ctx2.reg.set_active(None)
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    rc = cli.cmd_grab(ctx2, types.SimpleNamespace(instance=None, interval=60, timeout_hours=6.0,
+                                                  notify_cmd=None, once=False, dry_run=False, json=False))
+check("cli grab 无目标 rc=2", rc == cli.EXIT_USAGE, str(rc))
 
 print("\n" + ("ALL PASS" if not FAILURES else f"{len(FAILURES)} FAILURES: {FAILURES}"))
 sys.exit(1 if FAILURES else 0)
