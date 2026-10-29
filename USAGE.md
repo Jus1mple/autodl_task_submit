@@ -196,6 +196,7 @@ autodl batch --file jobs.yaml [--max-parallel N] [--on-finish release|power_off|
 |---|---|
 | `autodl idle-guard [--idle-minutes 15] [--once]` | 空闲自动关机看门狗（GPU 利用率 + 显存双判；实例上 `touch /root/.autodl_keepalive` 豁免；SSH 不通绝不误判为空闲）|
 | `autodl balance-watch --warn 50 --stop 10 [--stop-mode mine\|active\|stop_all]` | 账户余额预警/急停；默认 `mine` 只关我的实例 |
+| `autodl claim [uuid...]` / `autodl disown <uuid...>` | 手动认领/排除实例；`claim` 不带参数列出每台的判定与依据（§11）|
 | `autodl grab [--instance U] [--interval 60] [--timeout-hours 6] [--notify-cmd CMD] [--once]` | **抢卡**：守着一台关机实例反复试开机，等宿主机空出 GPU（§12）|
 | `autodl budget-guard [--interval 300] [--once]` | **个人预算守护**：今日/本周/本月花费触顶 → 关停我的全部 running；某台连续开机超 `max_session_hours` → 只关那台。绝不碰别人的（§11）|
 
@@ -295,6 +296,7 @@ autodl balance-watch --warn 50 --stop 10 &     # 余额告警/急停
 | `cost` | `rows: [...], total, disk, since, until, usage`（rows 字段随 `--by` 变化）|
 | `kill` | `run_id, killed, state, note` |
 | `grab` | `result (running\|timeout\|gone\|budget\|waiting\|interrupted), instance, attempts, waited, note` |
+| `claim`（不带 uuid）| `owner: [...], instances: [{instance_uuid, name, status, mine, reason}]` |
 | `clone` | `dir, branch, head, created, credentials, patches` |
 | `sync` | `dir, branch, mode, old, new, updated, dirty, blocked, error, message, patches` |
 | `setup` | `skipped, source, command, exit_code`（或后台句柄）|
@@ -374,8 +376,27 @@ info = tasks.refresh_run(ctx, ctx.reg.get_run(meta["run_id"]))   # 探活/tail/�
 
 - **口径**：一条 session = 我让某台实例处于 running 的一段时间，费用 = 该实例小时价（snapshot 的 `payg_price`，折后价）× 秒数 ÷ 3600。这与官方"按秒计费、时长 = 关机时间 − 开机时间"一致。关机不释放的数据盘另按 ¥0.01/GB/天 估算。
 - **记账时机**：本工具每次开机/创建/关机/释放自动开关 session；每次 `status` / `cost` / 预检前都用平台的 `started_at` / `stopped_at` **对账**——别人从控制台开关了我的机也能追平；实例从账号里消失则结清并标记释放。
-- **"我的"边界**：`owner: kedong` 后新建实例名为 `kedong/task-runner`。对账按前缀认领，换电脑、账本丢了也能重建；`use` 登记过的实例同样算我的。
+- **"我的"边界**：见下方「认领规则」。对账按名字认领，换电脑、账本丢了也能重建。
 - **账本**是人级的（`~/.autodl/ledger.db`，跨项目），run/指标台账仍是项目级的。`cost --by run` 会把两者按实例和时间对上。
+
+### 认领规则
+
+认领规则（决定哪些实例算"我的"，止损/预算/守护只作用于它们）：
+
+1. **手动排除**（`autodl disown <uuid>`）—— 最高优先级，一旦排除，其它线索一律不翻案。认领过头比认领不足危险得多：会让 `stop-all` / `budget-guard` 去关别人的机器。
+2. **手动认领**（`autodl claim <uuid>`）—— 给名字完全不守规矩的实例用。
+3. **实例名匹配 owner** —— `kedong/x`、`kedong-x`、`kedong_x`、`kedong.x` 都算，大小写不敏感。**必须有分隔符**，所以 `kedongxiao-test` 不会被误认。`owner` 可以写列表认多个名字。
+4. **个人账本登记过**（本工具开过的）。
+5. **项目台账登记过**（`use` / `run --instance` 用过的）。
+
+```bash
+autodl claim                    # 列出账号里每台实例的判定和依据
+autodl claim pro-xxxx           # 手动认领
+autodl disown pro-yyyy          # 手动排除
+autodl claim --auto pro-yyyy    # 清除手动标记，恢复自动判定
+```
+
+判定写在 `cost.claim_verdict()`，`status --all` 的 `mine` 字段、`stop-all`、`budget-guard`、`grab` 的预算检查全部走同一个判定。手动标记存在个人账本里（`~/.autodl/ledger.db` 的 `owned.claim`），跨项目生效。排除一台实例时会顺手结清它的未结 session，不再替它累计费用。
 
 四层限制，各管一件事：
 

@@ -33,6 +33,7 @@ Token 只放这里，不要写进代码、不要发到聊天里。
 
 ```yaml
 owner: 你的名字拼音          # 必填。账号是大家共用的，靠它区分哪些机器是你的
+                             # 实例名叫 你的名字-xxx 或 你的名字/xxx 都能认出来
 gpu_spec_uuid: v-48g-350w    # 要租的卡，见下表
 budget:
   daily_yuan: 50             # 每天最多花多少钱，超了自动拒绝开机
@@ -127,6 +128,14 @@ autodl run --script eval.sh --down
 
 ```bash
 autodl run --script train.sh --background --dry-run
+```
+
+**确认哪些机器算你的**（认错了预算就管不住）
+
+```bash
+autodl claim                    # 列出每台实例是谁的、为什么这么判
+autodl claim pro-xxxx           # 名字不规范的，手动认领
+autodl disown pro-yyyy          # 认错了，手动排除
 ```
 
 **没卡开不了机，让它替你等**（抢到会响一声并自动挂上关机保险丝）
@@ -251,6 +260,7 @@ autodl logs -f                实时看进度
 autodl logs --run-id N        看某个任务
 autodl kill --run-id N        停掉任务
 autodl grab --instance U      没卡时守着等，抢到就开机
+autodl claim                  看哪些机器算我的
 autodl down                   关机（保留环境）
 autodl cost                   花费报表
 加 --dry-run                  只预览不执行

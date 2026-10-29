@@ -30,6 +30,8 @@
 | `idle-guard` | 空闲自动关机看门狗 | `--idle-minutes` `--once` |
 | `balance-watch` | 账户余额预警/急停（默认只关我的）| `--warn` `--stop` `--stop-mode mine\|active\|stop_all` |
 | `budget-guard` | 个人预算/开机时长守护（只关我的）| `--interval` `--once` |
+| `claim` | 不带参数=列出每台实例归属判定与依据；带 uuid=手动认领 | `--auto`(恢复自动) |
+| `disown` | 手动排除实例（止损/预算/守护一律不碰）| |
 | `grab` | 抢卡：守着一台关机实例等宿主机空出 GPU | `--instance U` `--interval 60` `--timeout-hours 6`(0=不限) `--notify-cmd` `--once` |
 
 ## run 详解
@@ -62,7 +64,9 @@ regions: [westDC2, westDC3, beijingDC1]
 gpu_stock_name: vGPU-48GB
 min_balance_yuan: 10.0              # 账户余额护栏（共享账号下只是兜底）
 registry_path: .autodl/registry.db
-owner: ""                           # 我的标识：实例名前缀 "<owner>/"，止损/记账只认我的
+owner: ""                           # 我的标识。认领：名字 == owner，或 <owner><分隔符>... 开头
+                                    # （/ - _ . : 空格，大小写不敏感，必须有分隔符）。
+                                    # 可写列表 [kedong, kd]。手动：autodl claim/disown <uuid>
 budget:                             # 个人限额，0=不限；触顶退出码 7
   daily_yuan: 0                     # 今日/本周/本月我的花费上限（weekly_yuan / monthly_yuan 同理）
   max_session_hours: 0              # 单次开机保险丝（实例内 shutdown 定时器）

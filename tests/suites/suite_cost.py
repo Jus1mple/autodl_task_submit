@@ -508,5 +508,101 @@ with contextlib.redirect_stdout(buf):
                                                   notify_cmd=None, once=False, dry_run=False, json=False))
 check("cli grab 无目标 rc=2", rc == cli.EXIT_USAGE, str(rc))
 
+
+# ---------------- 认领规则（owner 匹配 + 手动 claim/disown） ----------------
+cfg1 = Config(owner="kedong")
+for nm, want in [("kedong", True), ("kedong/train", True), ("kedong-dja-rebuttal", True),
+                 ("kedong_x", True), ("kedong.x", True), ("kedong:x", True), ("kedong x", True),
+                 ("KeDong-X", True), ("  kedong/y  ", True),
+                 ("kedongxiao-test", False), ("kedong2", False), ("zedi创建", False),
+                 ("", False), ("xkedong-a", False)]:
+    check(f"name_is_mine({nm!r})={want}", cost.name_is_mine(cfg1, nm) is want)
+check("owner 空时谁都不认", not cost.name_is_mine(Config(owner=""), "kedong-x"))
+cfgl = Config(owner=["kedong", "kd"])
+check("owner 列表认多个名字", cost.name_is_mine(cfgl, "kd-foo") and cost.name_is_mine(cfgl, "kedong/bar")
+      and not cost.name_is_mine(cfgl, "zedi-x"))
+check("owner_names", cost.owner_names(cfgl) == ["kedong", "kd"] and cost.owner_names(Config()) == [])
+check("owner_prefix 取第一个", cost.owner_prefix(cfgl) == "kedong/" and cost.owner_prefix(Config()) == "")
+check("instance_name 仍带斜杠", cost.instance_name(cfgl) == "kedong/task-runner")
+
+# claim_verdict 优先级
+ctx = mkctx(owner="kedong")
+check("短名字不误匹配长名字", not cost.name_is_mine(Config(owner="kd"), "kedong-dja-rebuttal"))
+mine, why = cost.claim_verdict(ctx, {"uuid": "pro-n", "name": "kedong-dja-rebuttal"})
+check("名字匹配即我的", mine and "owner" in why, why)
+mine, why = cost.claim_verdict(ctx, {"uuid": "pro-o", "name": "zedi创建"})
+check("别人的不认", not mine and why == "无匹配", why)
+ctx.ledger.set_claim("pro-o", True)
+mine, why = cost.claim_verdict(ctx, {"uuid": "pro-o", "name": "zedi创建"})
+check("手动认领生效", mine and why == "手动认领", why)
+# 手动排除压过名字匹配（最高优先级）
+ctx.ledger.set_claim("pro-n", False)
+mine, why = cost.claim_verdict(ctx, {"uuid": "pro-n", "name": "kedong-dja-rebuttal"})
+check("手动排除压过名字匹配", not mine and "手动排除" in why, why)
+check("is_mine 与 verdict 一致", cost.is_mine(ctx, {"uuid": "pro-n", "name": "kedong-x"}) is False)
+# 排除也压过账本/台账
+ctx.ledger.adopt("pro-n", owner="kedong")
+ctx.reg.upsert_instance("pro-n", status_cached="running")
+check("手动排除压过账本和台账", not cost.is_mine(ctx, {"uuid": "pro-n", "name": ""}))
+# 恢复自动
+ctx.ledger.set_claim("pro-n", None)
+check("--auto 恢复自动判定", cost.is_mine(ctx, {"uuid": "pro-n", "name": "kedong-x"}))
+check("claims() 列出手动项", ctx.ledger.claims() == {"pro-o": True}, str(ctx.ledger.claims()))
+
+# disown 结清未结 session（不再替它累计费用）
+ctx = mkctx()
+ctx.ledger.open_session("pro-d", 2000, started_at=NOW - H)
+check("disown 前有未结 session", len(ctx.ledger.open_sessions()) == 1)
+ctx.ledger.set_claim("pro-d", False)
+check("disown 结清 session", not ctx.ledger.open_sessions())
+check("disown 后 usage 不再烧钱", cost.usage(ctx)["burn_rate"] == 0)
+
+# 旧库迁移：没有 claim 列的 owned 表要能自动补上
+import sqlite3 as _sq
+oldp = tmp / "old-ledger.db"
+_c = _sq.connect(str(oldp))
+_c.executescript("""CREATE TABLE owned (instance_uuid TEXT PRIMARY KEY, owner TEXT, name TEXT,
+ disk_gb REAL, created_at REAL, released_at REAL, last_seen REAL);
+ INSERT INTO owned(instance_uuid, owner) VALUES('pro-legacy','kedong');""")
+_c.commit(); _c.close()
+_led = cost.Ledger(oldp)
+_led.set_claim("pro-legacy", False)
+check("旧库自动补 claim 列", _led.claim_state("pro-legacy") is False)
+check("旧库数据保留", _led.owned(include_released=True)[0]["instance_uuid"] == "pro-legacy")
+
+# cli：claim 列表 / 认领 / 排除 / status 提示
+ctx = mkctx(owner="kedong")
+ctx.api.items = [item("pro-n", "kedong-dja-rebuttal"), item("pro-o", "zedi创建")]
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    rc = cli.cmd_claim(ctx, types.SimpleNamespace(instance_uuid=[], auto=False, json=True))
+cl = json.loads(buf.getvalue())
+check("cli claim --json 列判定", rc == 0 and [r["mine"] for r in cl["instances"]] == [True, False]
+      and cl["owner"] == ["kedong"], buf.getvalue()[:200])
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    cli.cmd_claim(ctx, types.SimpleNamespace(instance_uuid=[], auto=False, json=False))
+check("cli claim 文本带依据", "我" in buf.getvalue() and "他" in buf.getvalue()
+      and "无匹配" in buf.getvalue(), buf.getvalue()[:300])
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    rc = cli.cmd_claim(ctx, types.SimpleNamespace(instance_uuid=["pro-o"], auto=False, json=False))
+check("cli claim 认领", rc == 0 and ctx.ledger.claim_state("pro-o") is True)
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    rc = cli.cmd_disown(ctx, types.SimpleNamespace(instance_uuid=["pro-o"], json=False))
+check("cli disown 排除", rc == 0 and ctx.ledger.claim_state("pro-o") is False)
+with contextlib.redirect_stdout(io.StringIO()):
+    cli.cmd_claim(ctx, types.SimpleNamespace(instance_uuid=["pro-o"], auto=True, json=False))
+check("cli claim --auto 清除", ctx.ledger.claim_state("pro-o") is None)
+# status：一台都没认出来时给提示
+ctx2 = mkctx(owner="nobody")
+ctx2.api.items = [item("pro-x", "someone-else")]
+ctx2.api.balance_yuan = lambda: 100.0
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    cli.cmd_status(ctx2, types.SimpleNamespace(json=False, all=True))
+check("status 认不出时提示", "刹车现在是瞎的" in buf.getvalue(), buf.getvalue()[:300])
+
 print("\n" + ("ALL PASS" if not FAILURES else f"{len(FAILURES)} FAILURES: {FAILURES}"))
 sys.exit(1 if FAILURES else 0)

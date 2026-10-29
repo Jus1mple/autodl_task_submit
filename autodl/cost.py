@@ -66,9 +66,15 @@ CREATE TABLE IF NOT EXISTS owned (
     disk_gb       REAL,         -- 付费数据盘 GB（磁盘费估算用）
     created_at    REAL,
     released_at   REAL,         -- NULL = 仍存在
-    last_seen     REAL
+    last_seen     REAL,
+    claim         INTEGER       -- 1=手动认领 / 0=手动排除 / NULL=自动判定
 );
 """
+
+# 给旧库补列（新库的 CREATE 已含；ALTER 重复执行会报错，忽略即可）
+_MIGRATIONS = [
+    "ALTER TABLE owned ADD COLUMN claim INTEGER",
+]
 
 
 class Ledger:
@@ -79,6 +85,11 @@ class Ledger:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._conn() as c:
             c.executescript(_SCHEMA)
+            for stmt in _MIGRATIONS:
+                try:
+                    c.execute(stmt)
+                except sqlite3.OperationalError:
+                    pass  # 列已存在
 
     @contextmanager
     def _conn(self):
@@ -108,6 +119,39 @@ class Ledger:
                           "created_at=COALESCE(?, created_at), released_at=NULL, last_seen=? "
                           "WHERE instance_uuid=?",
                           (owner, name, disk_gb, created_at, now, instance_uuid))
+
+    # ---------------- 手动认领 / 排除 ----------------
+    def set_claim(self, instance_uuid, claimed):
+        """claimed: True=手动认领 / False=手动排除 / None=清除标记恢复自动判定。
+        排除时顺手结清未结 session——既然不算我的，就别再替它累计费用。"""
+        val = None if claimed is None else (1 if claimed else 0)
+        if claimed is False:
+            self.close_session(instance_uuid)
+        with self._conn() as c:
+            row = c.execute("SELECT instance_uuid FROM owned WHERE instance_uuid=?",
+                            (instance_uuid,)).fetchone()
+            if row is None:
+                c.execute("INSERT INTO owned(instance_uuid, created_at, last_seen, claim) "
+                          "VALUES(?,?,?,?)", (instance_uuid, time.time(), time.time(), val))
+            else:
+                c.execute("UPDATE owned SET claim=?, last_seen=? WHERE instance_uuid=?",
+                          (val, time.time(), instance_uuid))
+
+    def claim_state(self, instance_uuid):
+        """True=手动认领 / False=手动排除 / None=没手动设过。"""
+        with self._conn() as c:
+            r = c.execute("SELECT claim FROM owned WHERE instance_uuid=?",
+                          (instance_uuid,)).fetchone()
+        if r is None or r["claim"] is None:
+            return None
+        return bool(r["claim"])
+
+    def claims(self):
+        """{uuid: True/False} —— 所有手动设过的。"""
+        with self._conn() as c:
+            return {r["instance_uuid"]: bool(r["claim"])
+                    for r in c.execute("SELECT instance_uuid, claim FROM owned "
+                                       "WHERE claim IS NOT NULL")}
 
     def mark_released(self, instance_uuid, at=None):
         with self._conn() as c:
@@ -274,9 +318,37 @@ def price_milli(snap):
 
 
 # ---------------- "我的"边界 ----------------
+# <owner> 与后缀之间允许的分隔符。**必须有分隔符**，所以 owner=kedong 不会误认
+# kedongxiao-test 是我的——认领过头比认领不足危险得多（止损类命令会去关别人的机器）。
+_NAME_SEPS = "/-_.: "
+
+
+def owner_names(cfg):
+    """我的所有名字。owner 可以写成字符串 `kedong`，也可以写成列表 `[kedong, kd]`。"""
+    raw = getattr(cfg, "owner", "") or ""
+    items = raw if isinstance(raw, (list, tuple)) else [raw]
+    return [str(n).strip() for n in items if str(n).strip()]
+
+
 def owner_prefix(cfg):
-    o = (getattr(cfg, "owner", "") or "").strip()
-    return f"{o}/" if o else ""
+    """新建实例名用的前缀（取第一个名字）。"""
+    names = owner_names(cfg)
+    return f"{names[0]}/" if names else ""
+
+
+def name_is_mine(cfg, name):
+    """实例名是否是我的：等于我的某个名字，或以 <名字><分隔符> 开头。大小写不敏感，
+    所以 kedong/train、kedong-dja-rebuttal、Kedong_x 都算；kedongxiao-test 不算。"""
+    n = (name or "").strip().lower()
+    if not n:
+        return False
+    for o in owner_names(cfg):
+        o = o.lower()
+        if n == o:
+            return True
+        if n.startswith(o) and len(n) > len(o) and n[len(o)] in _NAME_SEPS:
+            return True
+    return False
 
 
 def instance_name(cfg, base=None):
@@ -292,21 +364,41 @@ def _uuid(item):
     return item.get("uuid") or item.get("instance_uuid")
 
 
-def is_mine(ctx, item):
-    """实例是否归我：名字带 owner 前缀，或账本/台账登记过。"""
+def claim_verdict(ctx, item):
+    """(是否归我, 依据)。判定顺序，前面的赢：
+
+    1. 手动排除（autodl disown）→ 否。**最高优先级**：认领过头会让 stop-all /
+       budget-guard 去关别人的机器，所以一旦显式说了"不是我的"，其它线索一律不翻案。
+    2. 手动认领（autodl claim）→ 是。给名字完全不守规矩的实例用。
+    3. 实例名匹配 owner（kedong/x、kedong-x、kedong_x，大小写不敏感）。
+    4. 个人账本登记过（本工具开过/对账认领过）。
+    5. 项目台账登记过（use / run --instance 用过）。
+    """
     uuid = _uuid(item) if isinstance(item, dict) else item
-    name = item.get("name") or "" if isinstance(item, dict) else ""
-    pre = owner_prefix(ctx.cfg)
-    if pre and name.startswith(pre):
-        return True
+    name = (item.get("name") or "") if isinstance(item, dict) else ""
     led = _ledger(ctx)
+    if led is not None:
+        c = led.claim_state(uuid)
+        if c is False:
+            return False, "手动排除（autodl claim --auto 可撤销）"
+        if c is True:
+            return True, "手动认领"
+    if name_is_mine(ctx.cfg, name):
+        return True, f"实例名匹配 owner={'/'.join(owner_names(ctx.cfg))}"
     if led is not None and led.is_owned(uuid):
-        return True
+        return True, "个人账本登记过"
     reg = getattr(ctx, "reg", None)
     try:
-        return bool(reg and reg.get_instance(uuid))
+        if reg and reg.get_instance(uuid):
+            return True, "项目台账登记过"
     except Exception:  # noqa: BLE001 - 桩/损坏台账都不该影响判定
-        return False
+        pass
+    return False, "无匹配"
+
+
+def is_mine(ctx, item):
+    """实例是否归我。依据见 claim_verdict。"""
+    return claim_verdict(ctx, item)[0]
 
 
 def my_instances(ctx, items=None):

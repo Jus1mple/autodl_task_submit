@@ -13,6 +13,7 @@
   logs [--run-id R]    查看后台任务日志 + 退出码 + 指标
   kill [--run-id R]    终止后台任务（kill 进程组）
   grab [--instance U]  抢卡：守着一台关机实例，等宿主机空出 GPU 就开机
+  claim / disown       手动认领/排除实例（决定哪些算"我的"）；claim 不带参数=列出判定
   runs [--limit N]     列出台账里的运行记录（含指标）
   cost [--since 7d]    我的花费报表（共享账号下只算我开机的时段）
   budget-guard         个人预算/会话时长守护（只关我的实例）
@@ -133,6 +134,8 @@ def cmd_status(ctx, args):
     mine = [r for r in rows if r["mine"]]
     print(f"账户余额: ¥{ctx.api.balance_yuan():.2f}（共享）    实例数: {len(rows)}，我的: {len(mine)}")
     print(_usage_line(u, ctx.cfg.budget))
+    if rows and not mine:
+        print("  ⚠️ 一台都没认出来 —— 预算/并发刹车现在是瞎的。跑 `autodl claim` 看判定依据。")
     show = rows if getattr(args, "all", False) else mine
     for r in show:
         mark = " *" if r["active"] else "  "
@@ -592,6 +595,45 @@ def cmd_cost(ctx, args):
     return EXIT_OK
 
 
+def cmd_claim(ctx, args):
+    """手动认领实例（不带 uuid 则列出账号里每台的归属判定与依据）。"""
+    if not args.instance_uuid:
+        rows = []
+        for it in ctx.api.list_instances():
+            uid = it.get("uuid") or it.get("instance_uuid") or "?"
+            mine, why = cost.claim_verdict(ctx, it)
+            rows.append({"instance_uuid": uid, "name": it.get("name") or "",
+                         "status": it.get("status"), "mine": mine, "reason": why})
+        if args.json:
+            print(json.dumps({"owner": cost.owner_names(ctx.cfg), "instances": rows},
+                             ensure_ascii=False))
+            return EXIT_OK
+        names = cost.owner_names(ctx.cfg)
+        print(f"owner = {'、'.join(names) if names else '(未配置)'}"
+              f"    账号里 {len(rows)} 台，我的 {sum(1 for r in rows if r['mine'])} 台")
+        for r in rows:
+            print(f"  {'我' if r['mine'] else '他'} {r['instance_uuid']:<20} "
+                  f"{(r['status'] or ''):<10} {r['name']:<26} {r['reason']}")
+        if not rows:
+            print("  (账号里没有 API 创建的 Pro 实例)")
+        else:
+            print("\n认领：autodl claim <uuid>    排除：autodl disown <uuid>    "
+                  "恢复自动：autodl claim --auto <uuid>")
+        return EXIT_OK
+    for uid in args.instance_uuid:
+        ctx.ledger.set_claim(uid, None if args.auto else True)
+        print(f"{'恢复自动判定' if args.auto else '已认领'}: {uid}")
+    return EXIT_OK
+
+
+def cmd_disown(ctx, args):
+    """手动排除实例：止损/预算/守护一律不再碰它，也不再替它记账。"""
+    for uid in args.instance_uuid:
+        ctx.ledger.set_claim(uid, False)
+        print(f"已排除（不再算我的，也不会被 stop-all/budget-guard 碰）: {uid}")
+    return EXIT_OK
+
+
 def cmd_grab(ctx, args):
     """抢卡：守着指定实例，等它的宿主机空出 GPU 就开机。"""
     uuid = args.instance or ctx.reg.get_active()
@@ -599,8 +641,9 @@ def cmd_grab(ctx, args):
         print("没有指定实例：用 --instance <uuid> 指定要抢哪一台（autodl status 看有哪些）。",
               file=sys.stderr)
         return EXIT_USAGE
-    if not ctx.cfg.owner:
-        _eprint("提示：autodl.yaml 没配 owner，预算/并发刹车认不出你已有的实例，抢卡期间不会拦你。")
+    if not cost.owner_names(ctx.cfg) and not ctx.ledger.claims():
+        _eprint("提示：没配 owner 也没手动认领过，预算/并发刹车认不出你已有的实例，"
+                "抢卡期间不会拦你。先跑 `autodl claim` 看看判定。")
     if args.dry_run:
         limit = f"最多 {args.timeout_hours:g}h" if args.timeout_hours > 0 else "不限时"
         print(f"[dry-run] 将守着 {uuid}，每 {args.interval}s 试一次开机（{limit}）")
@@ -846,6 +889,11 @@ def build_parser():
     sp.add_argument("--since", default="month", help="起点：7d / 24h / 2w / today / week / month(默认) / YYYY-MM-DD")
     sp.add_argument("--by", choices=["day", "instance", "session", "run"], default="day", help="汇总维度")
     sp.add_argument("--offline", action="store_true", help="不触网对账，只看本地账本")
+    sp = add("claim", help="手动认领实例；不带 uuid 则列出账号里每台的归属判定与依据")
+    sp.add_argument("instance_uuid", nargs="*", help="要认领的实例 uuid（可多个）")
+    sp.add_argument("--auto", action="store_true", help="清除手动标记，恢复自动判定")
+    sp = add("disown", help="手动排除实例：止损/预算/守护一律不碰，也不替它记账")
+    sp.add_argument("instance_uuid", nargs="+", help="要排除的实例 uuid（可多个）")
     sp = add("grab", help="抢卡：守着一台关机实例，等宿主机空出 GPU 就开机")
     sp.add_argument("--instance", help="要抢的实例 uuid（默认活动实例）")
     sp.add_argument("--interval", type=int, default=60, help="每隔多少秒试一次（默认 60）")
@@ -903,6 +951,7 @@ _DISPATCH = {
     "snapshot-env": cmd_snapshot_env, "idle-guard": cmd_idle_guard,
     "balance-watch": cmd_balance_watch, "batch": cmd_batch,
     "kill": cmd_kill, "cost": cmd_cost, "budget-guard": cmd_budget_guard, "grab": cmd_grab,
+    "claim": cmd_claim, "disown": cmd_disown,
 }
 
 

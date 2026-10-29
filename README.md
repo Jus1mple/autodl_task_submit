@@ -117,6 +117,7 @@ info = tasks.refresh_run(ctx, run)         # 探活/tail/完成登记/抓指标
 | `balance-watch --warn Y --stop Y` | 余额预警/急停守护（默认只关我的实例）|
 | `budget-guard [--once]` | 个人预算/开机时长守护：触顶只关我的实例 |
 | `grab [--instance U]` | **抢卡**：守着一台关机实例，等宿主机空出 GPU 就开机 |
+| `claim [uuid...]` / `disown <uuid...>` | 手动认领/排除实例；`claim` 不带参数=列出每台的归属判定与依据 |
 | `batch --file jobs.yaml [--max-parallel N]` | 批量并行调度：多实例跑多任务，记 run 台账、支持 resume |
 
 通用参数放在命令**后面**：`--config`、`--dry-run`、`--yes/-y`、`--json`。
@@ -248,7 +249,7 @@ autodl grab --instance pro-xxxx && autodl run --remote-script ~/train.sh --backg
 账号很多人共用时，余额是大家的，余额差分算不出你的份，AutoDL 也没有账单 API。`autodl` 用**归属式记账**：每次由它开机/关机就记一条 session，费用 = 该实例小时价（`payg_price`）× 时长，和官方按秒计费公式一致；每次 `status`/`cost` 都用平台的开关机时间对账。
 
 ```yaml
-owner: kedong                 # 新建实例名带 "kedong/" 前缀；status/stop-all/守护默认只认我的
+owner: kedong                 # 新建实例名带 "kedong/" 前缀；kedong-x、kedong_x 也认（可写列表）
 budget:
   daily_yuan: 80              # 今日花费上限，触顶拒绝开机/提交（退出码 7）
   max_session_hours: 12       # 单次开机保险丝：实例内挂 shutdown 定时器，本地断网也自关
@@ -261,6 +262,21 @@ budget:
 autodl cost --since 7d --by instance   # 我最近 7 天花在哪几台上
 autodl cost --by run                   # 每个 run 多少钱；run 之间的空档就是闲置开销
 autodl budget-guard &                  # 触顶/超时长只关我的实例，绝不碰别人的
+```
+
+认领规则（决定哪些实例算"我的"，止损/预算/守护只作用于它们）：
+
+1. **手动排除**（`autodl disown <uuid>`）—— 最高优先级，一旦排除，其它线索一律不翻案。认领过头比认领不足危险得多：会让 `stop-all` / `budget-guard` 去关别人的机器。
+2. **手动认领**（`autodl claim <uuid>`）—— 给名字完全不守规矩的实例用。
+3. **实例名匹配 owner** —— `kedong/x`、`kedong-x`、`kedong_x`、`kedong.x` 都算，大小写不敏感。**必须有分隔符**，所以 `kedongxiao-test` 不会被误认。`owner` 可以写列表认多个名字。
+4. **个人账本登记过**（本工具开过的）。
+5. **项目台账登记过**（`use` / `run --instance` 用过的）。
+
+```bash
+autodl claim                    # 列出账号里每台实例的判定和依据
+autodl claim pro-xxxx           # 手动认领
+autodl disown pro-yyyy          # 手动排除
+autodl claim --auto pro-yyyy    # 清除手动标记，恢复自动判定
 ```
 
 这是归属估算不是发票（单价按开机时快照、代金券看不到），月底拿控制台账单按自己的实例 uuid 对一次即可。详见 `USAGE.md` §11。
